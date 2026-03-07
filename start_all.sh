@@ -2,7 +2,8 @@
 # ============================================================
 #  DGX Spark 一键启动脚本
 #  功能：自动启动 vLLM 推理服务 + OpenClaw Gateway
-#  使用：bash start_all.sh
+#  使用：bash start_all.sh [--port PORT]
+#  示例：bash start_all.sh --port 8080
 #  停止：bash start_all.sh stop
 # ============================================================
 set -euo pipefail
@@ -11,8 +12,51 @@ set -euo pipefail
 MODEL_DIR="$HOME/openclaw_project/models"       # 模型所在目录
 MODEL_NAME="MiniMax-M2.5-REAP-NVFP4"           # 模型文件夹名称
 VLLM_PORT=8000                                  # vLLM 服务端口
-GATEWAY_PORT=18789                              # OpenClaw Gateway 端口
+GATEWAY_PORT=18789                              # OpenClaw Gateway 默认端口
 VLLM_CONTAINER_NAME="vllm-minimax"             # Docker 容器名称
+# ─────────────────────────────────────────────────────────────
+
+# ── 命令行参数解析 ─────────────────────────────────────────────
+# 支持：
+#   --port PORT   指定 OpenClaw Gateway 对外 HTTP 端口（覆盖上方默认值）
+#   stop          停止所有服务
+#   -h / --help   显示帮助
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --port)
+            if [[ -z "${2:-}" || ! "${2}" =~ ^[0-9]+$ || "${2}" -lt 1 || "${2}" -gt 65535 ]]; then
+                echo -e "\033[0;31m  ✗ --port 参数无效，请指定 1-65535 之间的整数\033[0m"
+                exit 1
+            fi
+            GATEWAY_PORT="$2"
+            shift 2
+            ;;
+        stop)
+            # 直接调用 stop 逻辑并退出
+            bash "$0" stop_internal
+            exit 0
+            ;;
+        -h|--help)
+            echo "用法：bash start_all.sh [--port PORT]"
+            echo ""
+            echo "选项："
+            echo "  --port PORT   指定 OpenClaw Gateway 对外 HTTP 端口（默认：18789）"
+            echo "  stop          停止所有服务（vLLM 容器 + Gateway）"
+            echo "  -h, --help    显示此帮助信息"
+            echo ""
+            echo "示例："
+            echo "  bash start_all.sh                # 使用默认端口 18789 启动"
+            echo "  bash start_all.sh --port 8080    # 使用端口 8080 启动"
+            echo "  bash start_all.sh stop           # 停止所有服务"
+            exit 0
+            ;;
+        *)
+            echo -e "\033[0;31m  ✗ 未知参数：$1\033[0m"
+            echo "用法：bash start_all.sh [--port PORT]"
+            exit 1
+            ;;
+    esac
+done
 # ─────────────────────────────────────────────────────────────
 
 CONFIG_DIR="$HOME/.openclaw"
@@ -37,6 +81,33 @@ print_banner() {
 }
 
 print_banner
+
+# ── stop 模式：停止所有服务 ────────────────────────────────────
+if [[ "${1:-}" == "stop_internal" ]]; then
+    echo -e "${YELLOW}正在停止所有服务...${NC}"
+    # 停止 vLLM 容器
+    if docker ps -a --format '{{.Names}}' | grep -q "^${VLLM_CONTAINER_NAME}$"; then
+        docker rm -f "$VLLM_CONTAINER_NAME" 2>/dev/null || true
+        echo -e "${GREEN}  ✓ vLLM 容器已停止${NC}"
+    else
+        echo -e "${GREEN}  ✓ vLLM 容器未运行，跳过${NC}"
+    fi
+    # 停止 Gateway
+    if lsof -i ":${GATEWAY_PORT}" > /dev/null 2>&1; then
+        openclaw gateway stop 2>/dev/null || true
+        sleep 1
+        PID=$(lsof -ti ":${GATEWAY_PORT}" 2>/dev/null || true)
+        [[ -n "$PID" ]] && kill "$PID" 2>/dev/null || true
+        echo -e "${GREEN}  ✓ OpenClaw Gateway 已停止${NC}"
+    else
+        echo -e "${GREEN}  ✓ OpenClaw Gateway 未运行，跳过${NC}"
+    fi
+    echo -e "${GREEN}${BOLD}所有服务已停止。${NC}"
+    exit 0
+fi
+
+echo -e "    OpenClaw Gateway 端口：${CYAN}${BOLD}${GATEWAY_PORT}${NC}"
+echo ""
 
 # ── 步骤 1：检查依赖 ──────────────────────────────────────────
 echo -e "${YELLOW}[1/6] 检查依赖...${NC}"
@@ -148,7 +219,7 @@ else
     echo -e "${GREEN}  ✓ 已生成新 Token${NC}"
 fi
 
-# 停止已有 Gateway 实例
+# 停止已有 Gateway 实例（检查当前指定端口）
 if lsof -i ":${GATEWAY_PORT}" > /dev/null 2>&1; then
     openclaw gateway stop 2>/dev/null || true
     sleep 2
@@ -156,7 +227,7 @@ if lsof -i ":${GATEWAY_PORT}" > /dev/null 2>&1; then
     [[ -n "$PID" ]] && kill "$PID" 2>/dev/null || true
 fi
 
-# 写入配置文件
+# 写入配置文件（使用命令行指定的 GATEWAY_PORT）
 cat > "$CONFIG_FILE" <<EOF
 {
   "gateway": {
@@ -208,6 +279,7 @@ cat > "$CONFIG_FILE" <<EOF
 EOF
 
 echo -e "${GREEN}  ✓ 配置文件已写入 ${CONFIG_FILE}${NC}"
+echo -e "${GREEN}  ✓ Gateway 端口：${BOLD}${GATEWAY_PORT}${NC}"
 
 # ── 步骤 6：打印访问链接并启动 Gateway ───────────────────────
 echo ""
