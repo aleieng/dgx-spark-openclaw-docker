@@ -124,6 +124,35 @@ if [[ ! -d "${MODEL_DIR}/${MODEL_NAME}" ]]; then
 fi
 echo -e "${GREEN}  ✓ 所有依赖检查通过${NC}"
 
+# ── 步骤 1.5：校验模型关键 JSON 文件完整性 ──────────────────
+# config.json 损坏（下载不完整）是 vLLM 启动失败最常见的原因
+echo -e "${YELLOW}[1.5/6] 校验模型文件完整性...${NC}"
+JSON_CORRUPT=false
+for JSON_FILE in config.json generation_config.json; do
+    FULL_PATH="${MODEL_DIR}/${MODEL_NAME}/${JSON_FILE}"
+    if [[ ! -f "$FULL_PATH" ]]; then
+        echo -e "    ${YELLOW}[缺失]${NC} ${JSON_FILE}"
+        JSON_CORRUPT=true
+        continue
+    fi
+    # 用 python3 验证 JSON 格式是否合法
+    if ! python3 -c "import json,sys; json.load(open('${FULL_PATH}'))" 2>/dev/null; then
+        echo -e "    ${RED}[损坏]${NC} ${JSON_FILE} 不是有效的 JSON 文件（可能下载不完整）"
+        rm -f "$FULL_PATH"
+        JSON_CORRUPT=true
+    else
+        echo -e "    ${GREEN}[正常]${NC} ${JSON_FILE}"
+    fi
+done
+if [[ "$JSON_CORRUPT" == "true" ]]; then
+    echo -e ""
+    echo -e "${RED}  ✗ 模型文件损坏或缺失，请重新运行 install.sh 补充下载：${NC}"
+    echo -e "${CYAN}      ./install.sh${NC}"
+    echo -e "    install.sh 会自动跳过已完整的文件，只下载缺失/损坏的部分。"
+    exit 1
+fi
+echo -e "${GREEN}  ✓ 模型关键文件校验通过${NC}"
+
 # ── 步骤 2：停止旧的 vLLM 容器（如有）────────────────────────
 echo ""
 echo -e "${YELLOW}[2/6] 清理旧的 vLLM 容器...${NC}"
