@@ -331,12 +331,10 @@ else
         echo ""
         echo -e "${CYAN}  ▶ 方案 A：使用 hf download（官方 HuggingFace）...${NC}"
         set +e
-        # --resume-download 支持断点续传
-        # hf download 会自动跳过已完整的文件
+        # hf download 自动跳过已完整的文件（不需要 --resume-download，该参数在 1.5+ 已移除）
         "$HF_CMD" download "$MODEL_REPO" \
             --local-dir "$DEST_DIR" \
-            --repo-type model \
-            --resume-download
+            --repo-type model
         HF_STATUS=$?
         set -e
 
@@ -366,8 +364,7 @@ else
         HF_ENDPOINT="${HF_ENDPOINT}" \
         "$HF_CMD" download "$MODEL_REPO" \
             --local-dir "$DEST_DIR" \
-            --repo-type model \
-            --resume-download
+            --repo-type model
         HF_STATUS=$?
         set -e
 
@@ -409,17 +406,49 @@ else
             FILE_DIR=$(dirname "$LOCAL_FILE")
             mkdir -p "$FILE_DIR"
 
-            # 完整性校验：大小完全匹配则跳过
-            if [[ -f "$LOCAL_FILE" && "$EXPECTED_SIZE" -gt 0 ]]; then
-                ACTUAL_SIZE=$(stat -c%s "$LOCAL_FILE" 2>/dev/null || echo 0)
-                if [[ "$ACTUAL_SIZE" -eq "$EXPECTED_SIZE" ]]; then
-                    echo -e "    ${GREEN}[跳过]${NC} ${RFILENAME} （已完整）"
-                    WGET_SKIPPED=$((WGET_SKIPPED + 1))
-                    continue
-                elif [[ "$ACTUAL_SIZE" -gt 0 ]]; then
-                    SIZE_MB_ACTUAL=$(echo "scale=1; $ACTUAL_SIZE / 1048576" | bc)
-                    SIZE_MB_EXP=$(echo "scale=1; $EXPECTED_SIZE / 1048576" | bc)
-                    echo "    [续传] ${RFILENAME} （已有 ${SIZE_MB_ACTUAL}/${SIZE_MB_EXP} MB）"
+            # 完整性校验：大小匹配则跳过（size=0 时用文件存在性 + JSON 校验判断）
+            if [[ -f "$LOCAL_FILE" ]]; then
+                if [[ "$EXPECTED_SIZE" -gt 0 ]]; then
+                    # API 有返回大小：比对字节数
+                    ACTUAL_SIZE=$(stat -c%s "$LOCAL_FILE" 2>/dev/null || echo 0)
+                    if [[ "$ACTUAL_SIZE" -eq "$EXPECTED_SIZE" ]]; then
+                        # 对 JSON 文件额外做格式校验
+                        if [[ "$RFILENAME" == *.json ]]; then
+                            if python3 -c "import json; json.load(open('${LOCAL_FILE}'))" 2>/dev/null; then
+                                echo -e "    ${GREEN}[跳过]${NC} ${RFILENAME} （已完整）"
+                                WGET_SKIPPED=$((WGET_SKIPPED + 1))
+                                continue
+                            else
+                                echo -e "    ${YELLOW}[JSON损坏]${NC} ${RFILENAME}，将重新下载"
+                                rm -f "$LOCAL_FILE"
+                            fi
+                        else
+                            echo -e "    ${GREEN}[跳过]${NC} ${RFILENAME} （已完整）"
+                            WGET_SKIPPED=$((WGET_SKIPPED + 1))
+                            continue
+                        fi
+                    elif [[ "$ACTUAL_SIZE" -gt 0 ]]; then
+                        SIZE_MB_ACTUAL=$(echo "scale=1; $ACTUAL_SIZE / 1048576" | bc)
+                        SIZE_MB_EXP=$(echo "scale=1; $EXPECTED_SIZE / 1048576" | bc)
+                        echo "    [续传] ${RFILENAME} （已有 ${SIZE_MB_ACTUAL}/${SIZE_MB_EXP} MB）"
+                    fi
+                else
+                    # API 未返回大小（size=0）：对 JSON 文件做格式校验，其他文件如果已存在则跳过
+                    if [[ "$RFILENAME" == *.json ]]; then
+                        if python3 -c "import json; json.load(open('${LOCAL_FILE}'))" 2>/dev/null; then
+                            echo -e "    ${GREEN}[跳过]${NC} ${RFILENAME} （JSON 校验通过）"
+                            WGET_SKIPPED=$((WGET_SKIPPED + 1))
+                            continue
+                        else
+                            echo -e "    ${YELLOW}[JSON损坏]${NC} ${RFILENAME}，将重新下载"
+                            rm -f "$LOCAL_FILE"
+                        fi
+                    else
+                        # 非 JSON 文件且 size=0：文件已存在则跳过（无法校验）
+                        echo -e "    ${GREEN}[跳过]${NC} ${RFILENAME} （文件已存在）"
+                        WGET_SKIPPED=$((WGET_SKIPPED + 1))
+                        continue
+                    fi
                 fi
             fi
 
