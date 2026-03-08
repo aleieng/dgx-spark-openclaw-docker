@@ -1,230 +1,298 @@
-# 最终部署文档：DGX Spark + vLLM + MiniMax-M2.5 (NVFP4)
+# DGX Spark + OpenClaw 详细部署文档
 
-**作者：Ken He | 日期：2026年3月3日**
+**作者：Ken He | 更新日期：2026年3月**
 
-> **前言**：本文档是在经历了多次实际部署测试和迭代后，总结出的在 NVIDIA DGX Spark 上稳定运行 MiniMax-M2.5-REAP (NVFP4) 模型的最终方案。方案基于 vLLM 和社区优化的 Docker 镜像，解决了在 GB10 (sm_121a) 架构上遇到的多个底层硬件兼容性问题。
+> 本文档记录了在 NVIDIA DGX Spark 上稳定运行本地大模型并接入 OpenClaw 的完整方案，包含架构说明、关键参数解析和常见问题排查。
 
 ---
 
-## 1. 最终架构
+## 1. 整体架构
 
 ```
-用户 -> OpenClaw (端口 3000) -> vLLM 推理服务 (Docker, 端口 8000) -> MiniMax-M2.5-REAP (NVFP4) -> DGX Spark
+用户浏览器
+    │
+    ▼
+OpenClaw Gateway（端口 18789，局域网可访问）
+    │  OpenAI 兼容 API
+    ▼
+推理服务（vLLM / Ollama，仅本机访问）
+    │
+    ▼
+本地模型（DGX Spark 128GB 统一内存）
 ```
 
-- **推理引擎**: **vLLM**
-- **Docker 镜像**: **`avarok/dgx-vllm-nvfp4-kernel:v22`** (专为 DGX Spark 优化的社区镜像)
-- **模型**: `lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4`
+三种部署方案的架构完全相同，只是推理框架和模型不同：
 
-## 2. 环境准备
+| 方案 | 模型 | 推理框架 | 推理端口 |
+|------|------|----------|----------|
+| A | Qwen3.5-35B-A3B | vLLM（标准镜像） | 8000 |
+| B | MiniMax-M2.5-REAP-NVFP4 | vLLM（NVFP4 专用镜像） | 8000 |
+| C | GLM-4.7-Flash | Ollama | 11434 |
 
-### 2.1 创建并进入工作目录
+---
+
+## 2. 环境要求
+
+### 2.1 硬件
+
+- **设备**：NVIDIA DGX Spark
+- **内存**：128GB 统一内存（GPU + CPU 共享）
+- **存储**：至少 100GB 可用空间（用于模型文件）
+
+### 2.2 软件
+
+- Ubuntu 22.04+
+- Docker（方案 A/B 必须）
+- curl、wget、jq、python3
+
+### 2.3 关于 Docker 代理
+
+DGX Spark 上如果配置了 `~/.docker/config.json` 中的全局代理（如 Clash、V2Ray），Docker 容器会继承代理设置，导致推理服务的内部 warmup 请求被代理拦截而失败。
+
+`start_all.sh` 已在所有 `docker run` 命令中显式清除代理环境变量：
 
 ```bash
-mkdir -p ~/openclaw_project/models
-cd ~/openclaw_project
+-e HTTP_PROXY="" -e HTTPS_PROXY="" -e http_proxy="" -e https_proxy="" \
+-e NO_PROXY="*" -e no_proxy="*"
 ```
 
-### 2.2 登录 NVIDIA NGC
+这只影响推理容器，不影响宿主机的代理设置。
+
+---
+
+## 3. 快速部署
+
+### 3.1 克隆仓库
 
 ```bash
-# 1. 前往 https://ngc.nvidia.com/ 获取 API Key
-# 2. 登录 (Username 固定为 $oauthtoken)
-docker login nvcr.io
+git clone https://github.com/your-username/dgx-spark-openclaw.git
+cd dgx-spark-openclaw
+chmod +x install.sh start_all.sh
 ```
 
-## 3. 下载模型
-
-### 3.1 安装 HuggingFace CLI
+### 3.2 运行安装脚本
 
 ```bash
-curl -LsSf https://hf.co/cli/install.sh | bash
+./install.sh
 ```
 
-### 3.2 下载模型文件
+安装脚本会完成以下工作：
+
+1. 交互式选择模型方案（菜单选择 1/2/3）
+2. 检查并安装基础依赖（Docker、curl、wget、jq、Node.js、Ollama）
+3. 全局安装 OpenClaw（`npm install -g openclaw`）
+4. 拉取推理框架 Docker 镜像（含国内镜像加速）
+5. 下载模型文件（含多方案容错和断点续传）
+6. 将部署配置保存至 `~/.openclaw_deploy_config`
+
+### 3.3 启动服务
 
 ```bash
-# 设置国内镜像加速
-export HF_ENDPOINT=https://hf-mirror.com
-
-# 下载模型到指定目录
-hf download lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4 \
-  --local-dir ~/openclaw_project/models/MiniMax-M2.5-REAP-NVFP4 \
-  --repo-type model
+./start_all.sh
 ```
 
-## 4. 部署 vLLM 推理服务
+启动脚本会完成以下工作：
 
-以下是经过反复测试验证成功的最终启动命令。
+1. 读取 `~/.openclaw_deploy_config` 中的部署配置
+2. 校验模型文件完整性
+3. 清理旧的推理服务容器/进程
+4. 启动推理服务（vLLM Docker 容器 或 Ollama 进程）
+5. 等待推理服务就绪（实时显示日志）
+6. 发送测试请求验证模型推理功能
+7. 生成或复用 OpenClaw token
+8. 停止已有 Gateway 实例（包括 systemd 管理的实例）
+9. 写入 `~/.openclaw/openclaw.json` 配置文件
+10. 启动 OpenClaw Gateway
+11. 输出完整的访问链接（含 token）
 
-### 4.1 设置模型路径
+---
+
+## 4. 方案 A：Qwen3.5-35B-A3B（vLLM）
+
+### 4.1 模型信息
+
+- **仓库**：`Qwen/Qwen3.5-35B-A3B`
+- **类型**：MoE（混合专家），激活参数 3.5B，总参数 35B
+- **精度**：BF16，约 70GB
+- **特点**：最新 Qwen3.5 系列，推理能力强，不开启 thinking 模式，直接输出答案
+
+### 4.2 Docker 启动命令（由脚本自动执行）
 
 ```bash
-export MODEL_DIR="$HOME/openclaw_project/models"
-```
-
-### 4.2 启动 vLLM 容器
-
-```bash
-docker run --rm --name vllm-minimax \
+docker run -d --name openclaw-vllm \
   --network host --gpus all --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 \
-  -v "$MODEL_DIR:/models" \
+  -v ~/openclaw_project/models:/models \
+  -e HTTP_PROXY="" -e HTTPS_PROXY="" -e http_proxy="" -e https_proxy="" \
+  -e NO_PROXY="*" -e no_proxy="*" \
+  vllm/vllm-openai:latest \
+  --model /models/Qwen3.5-35B-A3B \
+  --port 8000 \
+  --served-model-name qwen3.5-35b \
+  --trust-remote-code \
+  --gpu-memory-utilization 0.85 \
+  --max-model-len 32768 \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes
+```
+
+### 4.3 关键参数说明
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `--tool-call-parser` | `hermes` | Qwen3.5 使用 Hermes 格式工具调用 |
+| `--enable-auto-tool-choice` | （开关） | 启用自动工具选择，OpenClaw Agent 必须开启 |
+| `--trust-remote-code` | （开关） | 加载 Qwen3.5 自定义模型代码必须开启 |
+| `--max-model-len` | `32768` | 上下文长度，DGX Spark 内存充足可适当增大 |
+
+---
+
+## 5. 方案 B：MiniMax-M2.5-REAP-NVFP4（vLLM 专用内核）
+
+### 5.1 模型信息
+
+- **仓库**：`lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4`
+- **类型**：MoE，激活参数 10B，总参数 139B
+- **精度**：NVFP4 量化，约 78GB
+- **特点**：MiniMax 旗舰模型，专为 DGX Spark GB10 架构优化
+
+### 5.2 Docker 启动命令（由脚本自动执行）
+
+```bash
+docker run -d --name openclaw-vllm \
+  --network host --gpus all --ipc=host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v ~/openclaw_project/models:/models \
+  -e HTTP_PROXY="" -e HTTPS_PROXY="" -e http_proxy="" -e https_proxy="" \
+  -e NO_PROXY="*" -e no_proxy="*" \
+  -e MODEL="/models/MiniMax-M2.5-REAP-NVFP4" \
+  -e PORT=8000 \
+  -e GPU_MEMORY_UTIL=0.85 \
+  -e MAX_MODEL_LEN=32768 \
+  -e MAX_NUM_SEQS=16 \
   -e TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
   -e VLLM_NVFP4_GEMM_BACKEND=marlin \
   -e VLLM_TEST_FORCE_FP8_MARLIN=1 \
   -e VLLM_USE_FLASHINFER_MOE_FP4=0 \
-  avarok/dgx-vllm-nvfp4-kernel:v22 serve \
-  /models/MiniMax-M2.5-REAP-NVFP4 \
-  --port 8000 \
-  --quantization modelopt \
-  --gpu-memory-utilization 0.85 \
-  --max-model-len 32768 \
-  --max-num-seqs 16 \
-  --trust-remote-code \
-  --served-model-name "minimax-m2.5-nvfp4" \
-  --enable-auto-tool-choice \
-  --tool-call-parser minimax_m2
+  -e VLLM_EXTRA_ARGS="--quantization modelopt --trust-remote-code --served-model-name minimax-m2.5-nvfp4 --enable-auto-tool-choice --tool-call-parser minimax_m2" \
+  avarok/dgx-vllm-nvfp4-kernel:v22 serve
 ```
 
-### 4.3 关键参数解析
+### 5.3 关键参数说明
 
-| 参数/环境变量 | 值 | 作用与原因 |
-| :--- | :--- | :--- |
-| **镜像** | `avarok/dgx-vllm-nvfp4-kernel:v22` | **核心**。专为 DGX Spark (GB10) 优化的社区镜像，内置了解决硬件兼容性问题的补丁。 |
-| `-e TRITON_PTXAS_PATH` | `/usr/local/cuda/bin/ptxas` | **解决 `sm_121a not defined` 错误**。强制容器内的 Triton JIT 编译器使用宿主机上支持 GB10 架构的 `ptxas`。 |
-| `-e VLLM_NVFP4_GEMM_BACKEND` | `marlin` | **解决 `GEMM status=7` / `TMA descriptor` 错误**。切换 MoE 内核后端为 Marlin，避开 vLLM CUTLASS 内核在 GB10 上的兼容性问题。 |
-| `-e VLLM_USE_FLASHINFER_MOE_FP4` | `0` | 确保 Marlin 后端被激活。 |
-| `--quantization` | `modelopt` | 正确的量化加载标志，用于识别和加载 NVFP4 模型。 |
-| `serve` | (镜像名后的命令) | `avarok` 镜像的入口点需要 `serve` 子命令来启动服务。 |
-| `--enable-auto-tool-choice` | (开关) | **解决 400 错误**。启用 vLLM 的自动工具调用选择功能，OpenClaw Agent 发起工具调用时必须开启。 |
-| `--tool-call-parser` | `minimax_m2` | 指定 MiniMax-M2.5 专用的工具调用格式解析器，确保 OpenClaw 的工具调用请求被正确解析。 |
+| 参数/环境变量 | 值 | 说明 |
+|------|-----|------|
+| **镜像** | `avarok/dgx-vllm-nvfp4-kernel:v22` | 专为 DGX Spark (GB10) 优化的社区镜像，内置硬件兼容性补丁 |
+| `TRITON_PTXAS_PATH` | `/usr/local/cuda/bin/ptxas` | 解决 `sm_121a not defined` 错误，强制使用支持 GB10 架构的 ptxas |
+| `VLLM_NVFP4_GEMM_BACKEND` | `marlin` | 解决 `GEMM status=7` 错误，切换 MoE 内核后端为 Marlin |
+| `VLLM_USE_FLASHINFER_MOE_FP4` | `0` | 确保 Marlin 后端被激活 |
+| `--quantization` | `modelopt` | 正确识别和加载 NVFP4 模型的量化标志 |
+| `--tool-call-parser` | `minimax_m2` | MiniMax-M2.5 专用工具调用格式解析器 |
 
-## 5. 配置并启动 OpenClaw
+---
 
-### 5.1 安装 OpenClaw
+## 6. 方案 C：GLM-4.7-Flash（Ollama）
+
+### 6.1 模型信息
+
+- **模型名**：`glm-4.7-flash`（Ollama 官方库）
+- **类型**：MoE，激活参数 3B，总参数 30B
+- **精度**：Q4 量化，约 19GB
+- **特点**：最轻量方案，Ollama 自动管理，首次启动自动下载
+
+### 6.2 启动方式（由脚本自动执行）
 
 ```bash
-curl -fsSL https://openclaw.ai/install.sh | bash
+# 启动 Ollama 服务
+OLLAMA_HOST="0.0.0.0:11434" ollama serve &
+
+# 拉取模型（首次约 19GB）
+ollama pull glm-4.7-flash
 ```
 
-### 5.2 下载一键启动脚本
+### 6.3 注意事项
 
-为了避免手动配置 token 的麻烦，提供一个自动化脚本来完成所有配置和启动工作。将脚本下载到 DGX Spark 上：
+Ollama 提供 OpenAI 兼容 API（`/v1/chat/completions`），OpenClaw 可直接对接，无需额外配置。
+
+---
+
+## 7. OpenClaw 配置说明
+
+`start_all.sh` 会自动生成 `~/.openclaw/openclaw.json`，关键配置项说明如下：
+
+```json
+{
+  "gateway": {
+    "bind": "lan",                          // 允许局域网访问（不仅限于 127.0.0.1）
+    "auth": { "mode": "token", "token": "..." },  // token 认证
+    "controlUi": {
+      "allowInsecureAuth": true,            // 允许 HTTP（非 HTTPS）下的 token 认证
+      "dangerouslyDisableDeviceAuth": true  // 跳过 device pairing 验证
+    }
+  },
+  "models": {
+    "providers": {
+      "...": {
+        "compat": { "supportsStore": false }  // 禁用 store 字段（本地模型不支持）
+      }
+    }
+  }
+}
+```
+
+`supportsStore: false` 是关键配置，缺少此项会导致 OpenClaw 发送带 `"store": true` 的请求，本地 vLLM/Ollama 不支持该字段，返回 400 错误。
+
+---
+
+## 8. 访问 OpenClaw Web UI
+
+### 8.1 访问方式
+
+启动脚本会输出完整的访问链接：
+
+```
+http://192.168.0.103:18789/?token=abc123...
+```
+
+**请使用脚本输出的完整链接**（包含 `?token=xxx`），不要手动输入 IP:端口。Gateway 收到带 token 的请求后会建立服务端 session cookie，后续页面内导航时浏览器自动携带 cookie，不会因页面刷新而丢失认证。
+
+### 8.2 关于 systemd 自动启动
+
+OpenClaw 安装时会注册 `openclaw-gateway.service` systemd user service，该服务在用户登录后自动启动。`start_all.sh` 在启动前会先通过 `systemctl --user stop openclaw-gateway.service` 停止该服务，再启动配置好的实例。
+
+如果不需要 OpenClaw 随系统自动启动，可以禁用：
 
 ```bash
-wget -O ~/start_openclaw.sh https://raw.githubusercontent.com/your-repo/start_openclaw.sh
-chmod +x ~/start_openclaw.sh
-```
-
-> 如果无法从上面链接下载，可将本文档附带的 `start_openclaw.sh` 文件上传到 DGX Spark 的 `~/` 目录下，然后运行 `chmod +x ~/start_openclaw.sh`。
-
-### 5.3 启动 OpenClaw
-
-**一键启动（推荐）**
-
-```bash
-bash ~/start_openclaw.sh
-```
-
-脚本会自动完成以下所有工作，无需任何手动操作：
-
-| 步骤 | 内容 |
-| --- | --- |
-| 检查 vLLM | 自动检测 8000 端口的 vLLM 服务是否在运行 |
-| 停止旧实例 | 自动检测并停止已有 Gateway 实例，避免端口冲突 |
-| 生成 Token | 首次运行自动生成随机 token 并保存到 `~/.openclaw/.gateway_token`；再次运行自动复用，无需重新生成 |
-| 写入配置 | 自动将 token 写入 `~/.openclaw/openclaw.json`，并将 `bind` 设置为 `lan`，允许局域网访问 |
-| 打印链接 | 自动获取局域网 IP，打印本机和局域网两个带 token 的访问链接 |
-| 启动 Gateway | 自动启动 OpenClaw Gateway |
-
-运行成功后，终端会输出类似如下的信息：
-
-```
-========================================
-   Gateway 即将启动，访问链接如下：
-========================================
-
-  本机访问：  http://127.0.0.1:18789/?token=abc123...
-  局域网访问：http://192.168.1.100:18789/?token=abc123...
-
-  提示：首次访问时将链接复制到浏览器，token 会自动保存，后续无需再带 token
-========================================
-```
-
-将局域网访问链接复制到您的笔记本浏览器中，即可直接访问 OpenClaw Web UI。
-
-**如需后台持久运行**，将脚本放入 `screen` 中执行：
-
-```bash
-screen -S openclaw
-bash ~/start_openclaw.sh
-# 按 Ctrl+A 再按 D 脱离，进程在后台持续运行
-# 使用 screen -r openclaw 可重新连接
-```
-
-## 6. 验证
-
-```bash
-# 1. 检查 vLLM 服务
-curl http://127.0.0.1:8000/v1/models
-
-# 2. 检查 OpenClaw
-openclaw doctor
+systemctl --user disable openclaw-gateway.service
 ```
 
 ---
 
+## 9. 常见问题排查
 
-至此，您已成功在 DGX Spark 上通过 vLLM 部署了 MiniMax-M2.5 的 NVFP4 版本，并接入了 OpenClaw。
-
-## 7. 访问和使用 OpenClaw Web UI
-
-部署成功后，您可以通过浏览器与 OpenClaw 进行交互。
-
-### 7.1 访问方式
-
-OpenClaw 自带一个名为 "Control UI" 的 Web 界面，默认监听在 `18789` 端口。
-
-**方式一：在 DGX Spark 本地访问 (推荐)**
-
-在 DGX Spark 的桌面环境中打开浏览器，访问：
-
-```
-http://127.0.0.1:18789
-```
-
-由于是从本机访问，连接会自动被信任和批准。
-
-**方式二：从局域网其他电脑直接访问（无需配对）**
-
-OpenClaw 支持通过在 URL 中直接嵌入 token 的方式连接，**无需任何手动配对审批**。首先获取 DGX Spark 的局域网 IP：
+### 9.1 推理服务无响应
 
 ```bash
-# 在 DGX Spark 终端中运行，查看局域网 IP
-ip addr show | grep 'inet ' | grep -v '127.0.0.1'
+# 检查容器状态
+docker ps | grep openclaw
+
+# 查看容器日志
+docker logs --tail 50 openclaw-vllm
+
+# 检查 GPU 内存（正常加载后应占用 60-80GB）
+nvidia-smi
 ```
 
-然后在您的笔记本浏览器中访问以下 URL（将 `<DGX_IP>` 替换为实际 IP，`<YOUR_TOKEN_HERE>` 替换为您在配置文件中设置的 token）：
+如果 `nvidia-smi` 显示 GPU 内存只有 100-200MB，说明模型未正确加载，通常是代理问题或 OOM。
 
-```
-http://<DGX_IP>:18789/?token=<YOUR_TOKEN_HERE>
-```
+### 9.2 device identity required
 
-例如：
+确保使用脚本输出的完整 `?token=xxx` 链接访问。如果问题持续，清除浏览器缓存后重新访问。
 
-```
-http://192.168.1.100:18789/?token=abc123def456...
-```
+### 9.3 400 错误（OpenClaw 发送请求时）
 
-URL 中的 `token` 参数会被浏览器保存到 localStorage，后续访问无需再次带上 token。
+检查 `openclaw.json` 中是否有 `"compat": { "supportsStore": false }`。`start_all.sh` 会自动写入此配置，如果手动修改了配置文件可能丢失。
 
-> **注意**：该 token 就是您在 `config.json` 中配置的 `gateway.auth.token` 的値，两者必须一致。局域网访问时使用的是明文 HTTP，请确保在可信任的内网环境中使用。
+### 9.4 模型下载失败
 
-### 7.2 基本使用
-
-成功连接到 Control UI 后，您会看到一个类似聊天应用的界面。在这里您可以：
-
--   **直接对话**：在输入框中输入您的问题或指令，与背后由 MiniMax-M2.5 模型驱动的 AI Agent 进行交互。
--   **模型选择**：在界面右上角确认当前使用的模型是否为 `MiniMax-M2.5-REAP (本地 vLLM)`。
--   **管理配置**：通过左侧菜单栏进入设置，可以图形化地查看和修改 OpenClaw 的各项配置。
+重新运行 `./install.sh` 即可自动续传。脚本会按顺序尝试 ModelScope → HuggingFace 官方 → hf-mirror.com → wget 逐文件，任意一个成功即可。
