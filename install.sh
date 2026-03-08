@@ -221,9 +221,11 @@ DOCKEREOF
 fi
 
 # ── 步骤 5：下载模型文件 ──────────────────────────────────────
-# 策略：通过 HF API 获取文件列表和大小，用 wget -c 逐文件下载
-# 完全绕过 XetHub 协议（cas-bridge.xethub.hf.co），直接走 hf-mirror.com HTTP
-# 支持断点续传：重复运行时自动跳过已完整下载的文件
+# 三级降级策略：
+#   方案 A：hf download（官方 HuggingFace，无镜像）
+#   方案 B：hf download + hf-mirror.com 镜像
+#   方案 C：wget 逐文件直接下载（绕过 XetHub，走 hf-mirror.com 标准 HTTP）
+# 每种方案均支持：完整性检测（跳过已完整文件）+ 断点续传
 # ─────────────────────────────────────────────────────────────
 echo ""
 echo -e "${YELLOW}[5/5] 下载 MiniMax-M2.5-REAP-NVFP4 模型...${NC}"
@@ -236,124 +238,259 @@ mkdir -p "$DEST_DIR" "$HFD_CACHE"
 
 echo "    下载目录：${DEST_DIR}"
 echo "    仓库地址：${MODEL_REPO}"
-echo "    镜像源：  ${HF_ENDPOINT}"
 echo "    模型约 78GB，支持断点续传，可随时 Ctrl+C 后重新运行继续"
 echo ""
 
-# ── 5.1 获取仓库文件元数据 ──
-API_URL="${HF_ENDPOINT}/api/models/${MODEL_REPO}"
-echo "    正在获取文件列表（${API_URL}）..."
-HTTP_CODE=$(curl -L -s -w "%{http_code}" -o "$METADATA_FILE" "$API_URL")
-if [[ "$HTTP_CODE" != "200" ]]; then
-    echo -e "${RED}  ✗ 无法获取文件列表（HTTP ${HTTP_CODE}），请检查网络或镜像源是否可用${NC}"
-    echo -e "    API URL: ${API_URL}"
-    rm -f "$METADATA_FILE"
-    exit 1
+# ── 确定 hf 命令路径 ──────────────────────────────────────────
+HF_CMD=""
+if command -v hf &>/dev/null; then
+    HF_CMD="hf"
+elif command -v huggingface-cli &>/dev/null; then
+    HF_CMD="huggingface-cli"
 fi
-echo -e "${GREEN}  ✓ 文件列表获取成功${NC}"
 
-# ── 5.2 解析文件列表（rfilename + size）──
-# 使用 jq 解析，输出格式：<size> <rfilename>（每行一个文件）
-FILE_LIST=$(jq -r '.siblings[] | select(.rfilename != null) | [(.size // 0 | tostring), .rfilename] | join(" ")' "$METADATA_FILE")
-TOTAL_FILES=$(echo "$FILE_LIST" | grep -c '.' || true)
-echo "    共 ${TOTAL_FILES} 个文件需要检查"
-echo ""
+# ── 5.0 通过 HF API 获取文件元数据（用于完整性校验）──────────
+# 优先走官方，失败时走镜像
+_fetch_metadata() {
+    local api_url="$1"
+    local http_code
+    http_code=$(curl -L -s --connect-timeout 15 --max-time 30 \
+        -w "%{http_code}" -o "$METADATA_FILE" "$api_url" 2>/dev/null)
+    echo "$http_code"
+}
 
-# ── 5.3 逐文件检查完整性并下载 ──
-DOWNLOADED=0
-SKIPPED=0
-FAILED=0
-
-while IFS=' ' read -r EXPECTED_SIZE RFILENAME; do
-    [[ -z "$RFILENAME" ]] && continue
-
-    LOCAL_FILE="${DEST_DIR}/${RFILENAME}"
-    FILE_DIR=$(dirname "$LOCAL_FILE")
-    mkdir -p "$FILE_DIR"
-
-    # 检查文件是否已完整下载（大小匹配）
-    if [[ -f "$LOCAL_FILE" && "$EXPECTED_SIZE" -gt 0 ]]; then
-        ACTUAL_SIZE=$(stat -c%s "$LOCAL_FILE" 2>/dev/null || echo 0)
-        if [[ "$ACTUAL_SIZE" -eq "$EXPECTED_SIZE" ]]; then
-            echo -e "    ${GREEN}[跳过]${NC} ${RFILENAME} （已完整，${EXPECTED_SIZE} 字节）"
-            SKIPPED=$((SKIPPED + 1))
-            continue
-        elif [[ "$ACTUAL_SIZE" -gt 0 ]]; then
-            echo "    [续传] ${RFILENAME} （已有 ${ACTUAL_SIZE}/${EXPECTED_SIZE} 字节）"
-        fi
-    fi
-
-    # 构造直接 HTTP 下载 URL（绕过 XetHub，走 hf-mirror.com 标准路径）
-    DOWNLOAD_URL="${HF_ENDPOINT}/${MODEL_REPO}/resolve/main/${RFILENAME}"
-
-    # 格式化文件大小显示
-    if [[ "$EXPECTED_SIZE" -gt 0 ]]; then
-        SIZE_MB=$(echo "scale=1; $EXPECTED_SIZE / 1048576" | bc)
-        SIZE_HINT="${SIZE_MB} MB"
+echo "    正在获取文件列表..."
+META_OK=false
+# 先尝试官方 API
+HTTP_CODE=$(_fetch_metadata "https://huggingface.co/api/models/${MODEL_REPO}")
+if [[ "$HTTP_CODE" == "200" ]]; then
+    META_OK=true
+    echo -e "${GREEN}  ✓ 文件列表获取成功（官方 API）${NC}"
+else
+    # 再尝试镜像 API
+    HTTP_CODE=$(_fetch_metadata "${HF_ENDPOINT}/api/models/${MODEL_REPO}")
+    if [[ "$HTTP_CODE" == "200" ]]; then
+        META_OK=true
+        echo -e "${GREEN}  ✓ 文件列表获取成功（镜像 API）${NC}"
     else
-        SIZE_HINT="大小未知"
+        echo -e "${YELLOW}  ⚠ 无法获取文件列表（将跳过完整性预检，仍会尝试下载）${NC}"
     fi
-    echo -e "    ${CYAN}[下载]${NC} ${RFILENAME} (${SIZE_HINT})"
+fi
 
-    # 最多重试 5 次，每次失败后等待 10 秒再重试
-    MAX_RETRIES=5
-    WGET_STATUS=1
-    for RETRY in $(seq 1 $MAX_RETRIES); do
+# 解析文件列表（rfilename + size），用于完整性校验
+FILE_LIST=""
+TOTAL_FILES=0
+if [[ "$META_OK" == "true" ]]; then
+    FILE_LIST=$(jq -r '.siblings[] | select(.rfilename != null) | [(.size // 0 | tostring), .rfilename] | join(" ")' "$METADATA_FILE" 2>/dev/null || true)
+    TOTAL_FILES=$(echo "$FILE_LIST" | grep -c '.' 2>/dev/null || echo 0)
+    echo "    共 ${TOTAL_FILES} 个文件"
+fi
+
+# ── 完整性检查函数：所有文件大小是否全部匹配 ─────────────────
+_check_all_complete() {
+    # 如果没有元数据，无法判断，返回 1（不完整）
+    [[ "$META_OK" != "true" || -z "$FILE_LIST" ]] && return 1
+    local all_ok=true
+    while IFS=' ' read -r exp_size rfilename; do
+        [[ -z "$rfilename" ]] && continue
+        [[ "$exp_size" -le 0 ]] && continue
+        local local_file="${DEST_DIR}/${rfilename}"
+        if [[ ! -f "$local_file" ]]; then
+            all_ok=false; break
+        fi
+        local actual_size
+        actual_size=$(stat -c%s "$local_file" 2>/dev/null || echo 0)
+        if [[ "$actual_size" -ne "$exp_size" ]]; then
+            all_ok=false; break
+        fi
+    done <<< "$FILE_LIST"
+    [[ "$all_ok" == "true" ]]
+}
+
+# ── 检查是否已全部下载完整，若是则直接跳过 ──────────────────
+if _check_all_complete; then
+    echo -e "${GREEN}  ✓ 模型已完整下载，跳过下载步骤${NC}"
+else
+    DOWNLOAD_SUCCESS=false
+
+    # ════════════════════════════════════════════════════════
+    # 方案 A：hf download（官方 HuggingFace，无镜像）
+    # ════════════════════════════════════════════════════════
+    if [[ -n "$HF_CMD" ]]; then
+        echo ""
+        echo -e "${CYAN}  ▶ 方案 A：使用 hf download（官方 HuggingFace）...${NC}"
         set +e
-        # --progress=bar:force:noscroll 强制在脚本/非 TTY 环境中显示进度条
-        wget --progress=bar:force:noscroll -c \
-            --retry-connrefused \
-            --tries=1 \
-            --timeout=120 \
-            -O "$LOCAL_FILE" \
-            "$DOWNLOAD_URL" 2>&1
-        WGET_STATUS=$?
+        # --resume-download 支持断点续传
+        # hf download 会自动跳过已完整的文件
+        "$HF_CMD" download "$MODEL_REPO" \
+            --local-dir "$DEST_DIR" \
+            --repo-type model \
+            --resume-download
+        HF_STATUS=$?
         set -e
-        if [[ $WGET_STATUS -eq 0 ]]; then
-            break
-        fi
-        if [[ $RETRY -lt $MAX_RETRIES ]]; then
-            echo -e "    ${YELLOW}[重试 ${RETRY}/${MAX_RETRIES}]${NC} 等待 10 秒后重试..."
-            sleep 10
-        fi
-    done
 
-    if [[ $WGET_STATUS -eq 0 ]]; then
-        # 下载完成后再次验证大小
-        if [[ "$EXPECTED_SIZE" -gt 0 ]]; then
-            ACTUAL_SIZE=$(stat -c%s "$LOCAL_FILE" 2>/dev/null || echo 0)
-            if [[ "$ACTUAL_SIZE" -eq "$EXPECTED_SIZE" ]]; then
-                echo -e "    ${GREEN}[完成]${NC} ${RFILENAME} ✓"
-                DOWNLOADED=$((DOWNLOADED + 1))
+        if [[ $HF_STATUS -eq 0 ]]; then
+            # 下载完成后做完整性校验
+            if _check_all_complete || [[ "$META_OK" != "true" ]]; then
+                echo -e "${GREEN}  ✓ 方案 A 下载成功${NC}"
+                DOWNLOAD_SUCCESS=true
             else
-                echo -e "    ${YELLOW}[警告]${NC} ${RFILENAME} 大小不匹配（期望 ${EXPECTED_SIZE}，实际 ${ACTUAL_SIZE}），将在下次运行时重新下载"
-                rm -f "$LOCAL_FILE"
-                FAILED=$((FAILED + 1))
+                echo -e "${YELLOW}  ⚠ 方案 A 完成但文件校验不通过，尝试方案 B...${NC}"
             fi
         else
-            echo -e "    ${GREEN}[完成]${NC} ${RFILENAME} ✓"
-            DOWNLOADED=$((DOWNLOADED + 1))
+            echo -e "${YELLOW}  ⚠ 方案 A 失败（退出码 ${HF_STATUS}），尝试方案 B...${NC}"
         fi
     else
-        echo -e "    ${RED}[失败]${NC} ${RFILENAME}（已重试 ${MAX_RETRIES} 次，将在下次运行时继续）"
-        FAILED=$((FAILED + 1))
+        echo -e "${YELLOW}  ⚠ 未找到 hf / huggingface-cli 命令，跳过方案 A，直接尝试方案 B...${NC}"
     fi
 
-done <<< "$FILE_LIST"
+    # ════════════════════════════════════════════════════════
+    # 方案 B：hf download + hf-mirror.com 镜像
+    # ════════════════════════════════════════════════════════
+    if [[ "$DOWNLOAD_SUCCESS" == "false" && -n "$HF_CMD" ]]; then
+        echo ""
+        echo -e "${CYAN}  ▶ 方案 B：使用 hf download + hf-mirror.com 镜像...${NC}"
+        set +e
+        HF_HUB_DISABLE_XET=1 \
+        HF_ENDPOINT="${HF_ENDPOINT}" \
+        "$HF_CMD" download "$MODEL_REPO" \
+            --local-dir "$DEST_DIR" \
+            --repo-type model \
+            --resume-download
+        HF_STATUS=$?
+        set -e
 
-echo ""
-echo "    ────────────────────────────────────────"
-echo -e "    下载完成：${GREEN}${DOWNLOADED} 个新下载${NC}，${CYAN}${SKIPPED} 个已跳过${NC}，${RED}${FAILED} 个失败${NC}"
-echo "    ────────────────────────────────────────"
+        if [[ $HF_STATUS -eq 0 ]]; then
+            if _check_all_complete || [[ "$META_OK" != "true" ]]; then
+                echo -e "${GREEN}  ✓ 方案 B 下载成功${NC}"
+                DOWNLOAD_SUCCESS=true
+            else
+                echo -e "${YELLOW}  ⚠ 方案 B 完成但文件校验不通过，尝试方案 C...${NC}"
+            fi
+        else
+            echo -e "${YELLOW}  ⚠ 方案 B 失败（退出码 ${HF_STATUS}），尝试方案 C...${NC}"
+        fi
+    fi
 
-if [[ $FAILED -gt 0 ]]; then
-    echo -e "${YELLOW}  ⚠ 有 ${FAILED} 个文件下载失败，请重新运行本脚本继续下载${NC}"
-    exit 1
+    # ════════════════════════════════════════════════════════
+    # 方案 C：wget 逐文件直接下载（绕过 XetHub）
+    # ════════════════════════════════════════════════════════
+    if [[ "$DOWNLOAD_SUCCESS" == "false" ]]; then
+        echo ""
+        echo -e "${CYAN}  ▶ 方案 C：wget 逐文件直接下载（hf-mirror.com 标准 HTTP）...${NC}"
+
+        if [[ "$META_OK" != "true" || -z "$FILE_LIST" ]]; then
+            echo -e "${RED}  ✗ 无法获取文件列表，方案 C 无法执行，请检查网络后重新运行${NC}"
+            exit 1
+        fi
+
+        echo "    共 ${TOTAL_FILES} 个文件需要检查"
+        echo ""
+
+        WGET_DOWNLOADED=0
+        WGET_SKIPPED=0
+        WGET_FAILED=0
+
+        while IFS=' ' read -r EXPECTED_SIZE RFILENAME; do
+            [[ -z "$RFILENAME" ]] && continue
+
+            LOCAL_FILE="${DEST_DIR}/${RFILENAME}"
+            FILE_DIR=$(dirname "$LOCAL_FILE")
+            mkdir -p "$FILE_DIR"
+
+            # 完整性校验：大小完全匹配则跳过
+            if [[ -f "$LOCAL_FILE" && "$EXPECTED_SIZE" -gt 0 ]]; then
+                ACTUAL_SIZE=$(stat -c%s "$LOCAL_FILE" 2>/dev/null || echo 0)
+                if [[ "$ACTUAL_SIZE" -eq "$EXPECTED_SIZE" ]]; then
+                    echo -e "    ${GREEN}[跳过]${NC} ${RFILENAME} （已完整）"
+                    WGET_SKIPPED=$((WGET_SKIPPED + 1))
+                    continue
+                elif [[ "$ACTUAL_SIZE" -gt 0 ]]; then
+                    SIZE_MB_ACTUAL=$(echo "scale=1; $ACTUAL_SIZE / 1048576" | bc)
+                    SIZE_MB_EXP=$(echo "scale=1; $EXPECTED_SIZE / 1048576" | bc)
+                    echo "    [续传] ${RFILENAME} （已有 ${SIZE_MB_ACTUAL}/${SIZE_MB_EXP} MB）"
+                fi
+            fi
+
+            # 构造直接 HTTP URL（绕过 XetHub，走 hf-mirror.com 标准路径）
+            DOWNLOAD_URL="${HF_ENDPOINT}/${MODEL_REPO}/resolve/main/${RFILENAME}"
+
+            # 格式化文件大小
+            if [[ "$EXPECTED_SIZE" -gt 0 ]]; then
+                SIZE_MB=$(echo "scale=1; $EXPECTED_SIZE / 1048576" | bc)
+                SIZE_HINT="${SIZE_MB} MB"
+            else
+                SIZE_HINT="大小未知"
+            fi
+            echo -e "    ${CYAN}[下载]${NC} ${RFILENAME} (${SIZE_HINT})"
+
+            # 最多重试 5 次，每次失败后等待 10 秒
+            WGET_STATUS=1
+            for RETRY in $(seq 1 5); do
+                set +e
+                # --progress=bar:force:noscroll 强制在脚本/非 TTY 环境中显示进度条
+                # -c 支持断点续传（HTTP Range 请求）
+                wget --progress=bar:force:noscroll -c \
+                    --retry-connrefused \
+                    --tries=1 \
+                    --timeout=120 \
+                    -O "$LOCAL_FILE" \
+                    "$DOWNLOAD_URL" 2>&1
+                WGET_STATUS=$?
+                set -e
+                if [[ $WGET_STATUS -eq 0 ]]; then
+                    break
+                fi
+                if [[ $RETRY -lt 5 ]]; then
+                    echo -e "    ${YELLOW}[重试 ${RETRY}/5]${NC} 等待 10 秒后重试..."
+                    sleep 10
+                fi
+            done
+
+            if [[ $WGET_STATUS -eq 0 ]]; then
+                # 下载后再次校验大小
+                if [[ "$EXPECTED_SIZE" -gt 0 ]]; then
+                    ACTUAL_SIZE=$(stat -c%s "$LOCAL_FILE" 2>/dev/null || echo 0)
+                    if [[ "$ACTUAL_SIZE" -eq "$EXPECTED_SIZE" ]]; then
+                        echo -e "    ${GREEN}[完成]${NC} ${RFILENAME} ✓"
+                        WGET_DOWNLOADED=$((WGET_DOWNLOADED + 1))
+                    else
+                        echo -e "    ${YELLOW}[警告]${NC} ${RFILENAME} 大小不匹配，将在下次运行时重新下载"
+                        rm -f "$LOCAL_FILE"
+                        WGET_FAILED=$((WGET_FAILED + 1))
+                    fi
+                else
+                    echo -e "    ${GREEN}[完成]${NC} ${RFILENAME} ✓"
+                    WGET_DOWNLOADED=$((WGET_DOWNLOADED + 1))
+                fi
+            else
+                echo -e "    ${RED}[失败]${NC} ${RFILENAME}（已重试 5 次，将在下次运行时继续）"
+                WGET_FAILED=$((WGET_FAILED + 1))
+            fi
+
+        done <<< "$FILE_LIST"
+
+        echo ""
+        echo "    ────────────────────────────────────────"
+        echo -e "    方案 C 结果：${GREEN}${WGET_DOWNLOADED} 个新下载${NC}，${CYAN}${WGET_SKIPPED} 个已跳过${NC}，${RED}${WGET_FAILED} 个失败${NC}"
+        echo "    ────────────────────────────────────────"
+
+        if [[ $WGET_FAILED -gt 0 ]]; then
+            echo -e "${YELLOW}  ⚠ 有 ${WGET_FAILED} 个文件下载失败，请重新运行本脚本继续下载${NC}"
+            exit 1
+        fi
+
+        DOWNLOAD_SUCCESS=true
+    fi
+
+    if [[ "$DOWNLOAD_SUCCESS" != "true" ]]; then
+        echo -e "${RED}  ✗ 所有下载方案均失败，请检查网络后重新运行${NC}"
+        exit 1
+    fi
 fi
 
 echo -e "${GREEN}  ✓ 模型下载完成！${NC}"
 
-echo ""
 echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}${BOLD}║  🎉 环境安装完成！                           ║${NC}"
 echo -e "${GREEN}${BOLD}║  运行 ./start_all.sh 即可启动所有服务        ║${NC}"
