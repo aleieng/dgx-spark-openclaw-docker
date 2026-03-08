@@ -286,22 +286,33 @@ if [[ "$META_OK" == "true" ]]; then
     echo "    共 ${TOTAL_FILES} 个文件"
 fi
 
-# ── 完整性检查函数：所有文件大小是否全部匹配 ─────────────────
+# ── 完整性检查函数：文件大小匹配 + JSON 文件格式校验 ──────────
 _check_all_complete() {
     # 如果没有元数据，无法判断，返回 1（不完整）
     [[ "$META_OK" != "true" || -z "$FILE_LIST" ]] && return 1
     local all_ok=true
     while IFS=' ' read -r exp_size rfilename; do
         [[ -z "$rfilename" ]] && continue
-        [[ "$exp_size" -le 0 ]] && continue
         local local_file="${DEST_DIR}/${rfilename}"
+        # 文件不存在
         if [[ ! -f "$local_file" ]]; then
             all_ok=false; break
         fi
-        local actual_size
-        actual_size=$(stat -c%s "$local_file" 2>/dev/null || echo 0)
-        if [[ "$actual_size" -ne "$exp_size" ]]; then
-            all_ok=false; break
+        # 文件大小校验（size > 0 时才比对）
+        if [[ "$exp_size" -gt 0 ]]; then
+            local actual_size
+            actual_size=$(stat -c%s "$local_file" 2>/dev/null || echo 0)
+            if [[ "$actual_size" -ne "$exp_size" ]]; then
+                all_ok=false; break
+            fi
+        fi
+        # JSON 文件额外做格式校验（大小匹配不代表内容完整）
+        if [[ "$rfilename" == *.json ]]; then
+            if ! python3 -c "import json; json.load(open('${local_file}'))" 2>/dev/null; then
+                echo -e "    ${YELLOW}[JSON损坏]${NC} ${rfilename}，将重新下载"
+                rm -f "$local_file"
+                all_ok=false; break
+            fi
         fi
     done <<< "$FILE_LIST"
     [[ "$all_ok" == "true" ]]
