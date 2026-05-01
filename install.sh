@@ -204,44 +204,74 @@ case "$SELECTED_FRAMEWORK" in
         if docker image inspect "$VLLM_IMAGE" &>/dev/null; then
             echo -e "${GREEN}  ✓ 镜像已在本地，跳过拉取${NC}"
         else
-            # 写入国内镜像加速源
-            echo "    写入国内镜像加速源..."
-            sudo mkdir -p /etc/docker
-            sudo tee /etc/docker/daemon.json > /dev/null <<'DOCKEREOF'
-{
-  "registry-mirrors": [
-    "https://docker.1ms.run",
-    "https://hub.rat.dev",
-    "https://dockerproxy.net",
-    "https://proxy.vvvv.ee",
-    "https://docker.m.daocloud.io",
-    "https://registry.cyou"
-  ]
-}
-DOCKEREOF
-            sudo systemctl daemon-reload
-            sudo systemctl restart docker
-            sleep 3
-            echo -e "${GREEN}  ✓ Docker 国内镜像加速已配置${NC}"
+            MIRROR_PREFIXES=(
+                "docker.1ms.run"
+                "hub.rat.dev"
+                "dockerproxy.net"
+                "proxy.vvvv.ee"
+                "docker.m.daocloud.io"
+                "registry.cyou"
+            )
 
-            # 方案 A1：registry-mirrors 直接 pull
-            echo "    尝试通过 registry-mirrors 拉取镜像..."
+            # 默认不修改 /etc/docker/daemon.json，避免覆盖用户已有 Docker 配置。
+            # 如需合并写入 registry-mirrors，请显式运行：
+            #   CONFIGURE_DOCKER_MIRRORS=1 ./install.sh
+            if [[ "${CONFIGURE_DOCKER_MIRRORS:-0}" == "1" ]]; then
+                echo "    合并写入 Docker registry-mirrors（保留已有 daemon.json 配置）..."
+                DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
+                TMP_DAEMON_JSON="$(mktemp)"
+                if [[ -f "$DOCKER_DAEMON_JSON" ]]; then
+                    if ! jq empty "$DOCKER_DAEMON_JSON" >/dev/null 2>&1; then
+                        echo -e "${YELLOW}  ⚠ ${DOCKER_DAEMON_JSON} 不是有效 JSON，跳过自动写入镜像源${NC}"
+                        rm -f "$TMP_DAEMON_JSON"
+                    else
+                        jq '.["registry-mirrors"] = ((.["registry-mirrors"] // []) + [
+                            "https://docker.1ms.run",
+                            "https://hub.rat.dev",
+                            "https://dockerproxy.net",
+                            "https://proxy.vvvv.ee",
+                            "https://docker.m.daocloud.io",
+                            "https://registry.cyou"
+                        ] | unique)' "$DOCKER_DAEMON_JSON" > "$TMP_DAEMON_JSON"
+                    fi
+                else
+                    jq -n '{
+                        "registry-mirrors": [
+                            "https://docker.1ms.run",
+                            "https://hub.rat.dev",
+                            "https://dockerproxy.net",
+                            "https://proxy.vvvv.ee",
+                            "https://docker.m.daocloud.io",
+                            "https://registry.cyou"
+                        ]
+                    }' > "$TMP_DAEMON_JSON"
+                fi
+                if [[ -s "$TMP_DAEMON_JSON" ]]; then
+                    sudo mkdir -p /etc/docker
+                    if [[ -f "$DOCKER_DAEMON_JSON" ]]; then
+                        sudo cp "$DOCKER_DAEMON_JSON" "${DOCKER_DAEMON_JSON}.bak.$(date +%Y%m%d%H%M%S)"
+                    fi
+                    sudo tee "$DOCKER_DAEMON_JSON" < "$TMP_DAEMON_JSON" > /dev/null
+                    rm -f "$TMP_DAEMON_JSON"
+                    sudo systemctl daemon-reload
+                    sudo systemctl restart docker
+                    sleep 3
+                    echo -e "${GREEN}  ✓ Docker registry-mirrors 已合并配置${NC}"
+                fi
+            else
+                echo -e "${YELLOW}  ⚠ 默认不修改 /etc/docker/daemon.json；如需写入镜像源，请使用 CONFIGURE_DOCKER_MIRRORS=1${NC}"
+            fi
+
+            # 方案 A：直接 pull（可使用用户已有 Docker 配置）
+            echo "    尝试直接拉取镜像..."
             set +e
             docker pull "$VLLM_IMAGE"
             PULL_STATUS=$?
             set -e
 
-            # 方案 A2：逐一尝试镜像源前缀
+            # 方案 B：逐一尝试镜像源前缀，不修改 Docker daemon 配置
             if [[ $PULL_STATUS -ne 0 ]]; then
-                echo -e "${YELLOW}  ⚠ registry-mirrors 失败，改用镜像源前缀拉取...${NC}"
-                MIRROR_PREFIXES=(
-                    "docker.1ms.run"
-                    "hub.rat.dev"
-                    "dockerproxy.net"
-                    "proxy.vvvv.ee"
-                    "docker.m.daocloud.io"
-                    "registry.cyou"
-                )
+                echo -e "${YELLOW}  ⚠ 直接拉取失败，改用镜像源前缀拉取...${NC}"
                 for MIRROR in "${MIRROR_PREFIXES[@]}"; do
                     MIRROR_IMAGE="${MIRROR}/${VLLM_IMAGE}"
                     echo "    尝试：docker pull ${MIRROR_IMAGE}"

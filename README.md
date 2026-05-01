@@ -15,7 +15,7 @@
 - **一键部署**：`install.sh` + `start_all.sh` 覆盖全流程，无需手动配置 token 或编辑 JSON。
 - **DGX Spark 专属优化**：MiniMax 方案使用 `avarok/dgx-vllm-nvfp4-kernel` 社区优化镜像，充分利用 GB10 架构的 NVFP4 量化能力。
 - **代理兼容**：自动清除 Docker 容器内的代理环境变量，避免 `~/.docker/config.json` 中的全局代理干扰推理服务。
-- **网络优化**：内置国内镜像源（hf-mirror.com、ModelScope、Docker 镜像加速），无需 VPN 即可高速下载。
+- **网络优化**：内置国内镜像源（hf-mirror.com、ModelScope、Docker 镜像前缀拉取），默认不覆盖系统 Docker 配置。
 - **断点续传**：模型下载支持断点续传，可随时中断并重新运行脚本继续下载。
 - **容器化 OpenClaw**：OpenClaw Gateway 运行在 Docker bridge 网络中，不使用宿主机安装、不使用 host network，仅映射必要端口并挂载配置目录。
 - **动态端口**：支持通过 `--port` 参数指定 OpenClaw Gateway 对外端口，避免端口冲突。

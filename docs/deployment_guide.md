@@ -58,7 +58,19 @@ DGX Spark 上如果配置了 `~/.docker/config.json` 中的全局代理（如 Cl
 
 这只影响推理容器，不影响宿主机的代理设置。
 
-### 2.4 关于 OpenClaw Gateway 容器网络
+### 2.4 关于 Docker 镜像加速
+
+`install.sh` 默认不会写入或覆盖 `/etc/docker/daemon.json`。拉取 vLLM 镜像时，脚本会先执行普通 `docker pull`，失败后再尝试 `docker.1ms.run/...`、`hub.rat.dev/...` 等镜像源前缀方式拉取并重新打 tag。
+
+如果确实希望把国内 registry mirrors 合并写入 Docker daemon 配置，可以显式运行：
+
+```bash
+CONFIGURE_DOCKER_MIRRORS=1 ./install.sh
+```
+
+该模式会使用 `jq` 合并 `registry-mirrors`，保留已有配置项，并在写入前备份原文件为 `/etc/docker/daemon.json.bak.<时间戳>`。如果现有 `daemon.json` 不是有效 JSON，脚本会跳过自动写入。
+
+### 2.5 关于 OpenClaw Gateway 容器网络
 
 OpenClaw Gateway 运行在 Docker 默认 bridge 网络中，不使用 `--network host`。bridge 网络仍然具备出站访问互联网的能力，Gateway 可以访问外部 API；同时脚本只通过 `-p` 映射必要的 Gateway 端口。
 
