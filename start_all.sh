@@ -16,9 +16,12 @@ set -euo pipefail
 # ── 全局默认配置 ───────────────────────────────────────────────
 DEPLOY_CONFIG="$HOME/.openclaw_deploy_config"   # install.sh 生成的部署配置
 GATEWAY_PORT=18789                              # OpenClaw Gateway 默认端口
+GATEWAY_CONTAINER_PORT=18789                    # OpenClaw 容器内固定监听端口
 CONFIG_DIR="$HOME/.openclaw"
 CONFIG_FILE="$CONFIG_DIR/openclaw.json"
 TOKEN_FILE="$CONFIG_DIR/.gateway_token"
+OPENCLAW_GATEWAY_CONTAINER_NAME="openclaw-gateway"
+OPENCLAW_PLUGIN_VOLUME="openclaw-plugin-runtime-deps"
 
 # ── 颜色输出 ──────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -74,6 +77,7 @@ if [[ ! -f "$DEPLOY_CONFIG" ]]; then
 fi
 # shellcheck source=/dev/null
 source "$DEPLOY_CONFIG"
+OPENCLAW_IMAGE="${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}"
 
 # 根据框架确定推理服务端口
 case "${SELECTED_FRAMEWORK:-vllm}" in
@@ -113,13 +117,13 @@ if [[ "$_do_stop" == "true" ]]; then
         echo -e "${GREEN}  ✓ Ollama 服务已停止${NC}"
     fi
 
-    # 停止 OpenClaw Gateway
-    # 注意：OpenClaw 安装时会注册 systemd user service，必须先通过 systemctl 停止，
-    # 否则 systemd 会在进程被 kill 后立即重启新实例
-    systemctl --user stop openclaw-gateway.service 2>/dev/null || true
-    sleep 1
-    pkill -f openclaw-gateway 2>/dev/null || true
-    echo -e "${GREEN}  ✓ OpenClaw Gateway 已停止${NC}"
+    # 停止 OpenClaw Gateway 容器
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${OPENCLAW_GATEWAY_CONTAINER_NAME}$"; then
+        docker rm -f "$OPENCLAW_GATEWAY_CONTAINER_NAME" 2>/dev/null || true
+        echo -e "${GREEN}  ✓ OpenClaw Gateway 容器已停止${NC}"
+    else
+        echo -e "${GREEN}  ✓ OpenClaw Gateway 容器未运行${NC}"
+    fi
 
     echo -e "${GREEN}${BOLD}所有服务已停止。${NC}"
     exit 0
@@ -135,8 +139,15 @@ echo ""
 # ════════════════════════════════════════════════════════════════
 echo -e "${YELLOW}[1/6] 检查依赖...${NC}"
 
-if ! command -v openclaw &>/dev/null; then
-    echo -e "${RED}  ✗ 未找到 openclaw，请先运行 ./install.sh${NC}"; exit 1
+if ! command -v docker &>/dev/null; then
+    echo -e "${RED}  ✗ 未找到 docker，请先安装 Docker${NC}"; exit 1
+fi
+if ! docker info &>/dev/null 2>&1; then
+    echo -e "${RED}  ✗ 当前用户无法访问 Docker，请先运行 ./install.sh 或配置 Docker 权限${NC}"; exit 1
+fi
+if ! docker image inspect "$OPENCLAW_IMAGE" &>/dev/null; then
+    echo -e "${RED}  ✗ 未找到 OpenClaw Docker 镜像：${OPENCLAW_IMAGE}${NC}"
+    echo -e "    请先运行 ${CYAN}./install.sh${NC} 拉取镜像"; exit 1
 fi
 
 case "${SELECTED_FRAMEWORK:-vllm}" in
@@ -488,12 +499,8 @@ else
 fi
 
 # 停止已有 Gateway 实例
-# OpenClaw 安装时会注册 systemd user service（openclaw-gateway.service），
-# 必须先通过 systemctl 停止，否则 systemd 会在进程被 kill 后立即重启新实例
-echo -e "    正在停止已有 OpenClaw 实例..."
-systemctl --user stop openclaw-gateway.service 2>/dev/null || true
-sleep 1
-pkill -f openclaw-gateway 2>/dev/null || true
+echo -e "    正在停止已有 OpenClaw Gateway 容器..."
+docker rm -f "$OPENCLAW_GATEWAY_CONTAINER_NAME" 2>/dev/null || true
 sleep 1
 
 # 动态查询推理服务实际返回的模型 ID（确保与服务完全一致，避免 400 错误）
@@ -505,7 +512,8 @@ _get_actual_model_id() {
     echo "${model_id}"
 }
 
-BASE_URL="http://127.0.0.1:${INFERENCE_PORT}/v1"
+HOST_BASE_URL="http://127.0.0.1:${INFERENCE_PORT}/v1"
+BASE_URL="http://host.docker.internal:${INFERENCE_PORT}/v1"
 
 case "${SELECTED_FRAMEWORK:-vllm}" in
     vllm)
@@ -521,7 +529,7 @@ case "${SELECTED_FRAMEWORK:-vllm}" in
             REASONING=false
             CONTEXT_WINDOW=32768
         fi
-        MODEL_ID=$(_get_actual_model_id "${BASE_URL}/models")
+        MODEL_ID=$(_get_actual_model_id "${HOST_BASE_URL}/models")
         if [[ -z "$MODEL_ID" ]]; then
             [[ "${SELECTED_MODEL:-}" == "minimax" ]] && MODEL_ID="minimax-m2.5-nvfp4" || MODEL_ID="qwen3.5-35b"
             echo -e "    ${YELLOW}[警告]${NC} 无法动态获取模型 ID，使用默认值：${MODEL_ID}"
@@ -534,7 +542,7 @@ case "${SELECTED_FRAMEWORK:-vllm}" in
         MODEL_DISPLAY_NAME="GLM-4.7-Flash (本地 Ollama)"
         REASONING=true  # GLM-4.7-Flash 官方版支持 tools + thinking
         CONTEXT_WINDOW=32768
-        MODEL_ID=$(_get_actual_model_id "${BASE_URL}/models")
+        MODEL_ID=$(_get_actual_model_id "${HOST_BASE_URL}/models")
         if [[ -z "$MODEL_ID" ]]; then
             MODEL_ID="${MODEL_NAME}"
             echo -e "    ${YELLOW}[警告]${NC} 无法动态获取模型 ID，使用默认值：${MODEL_ID}"
@@ -549,7 +557,7 @@ cat > "$CONFIG_FILE" <<EOF
 {
   "gateway": {
     "mode": "local",
-    "port": ${GATEWAY_PORT},
+    "port": ${GATEWAY_CONTAINER_PORT},
     "bind": "lan",
     "auth": {
       "mode": "token",
@@ -617,19 +625,38 @@ echo ""
 echo -e "${YELLOW}[6/6] 正在启动 OpenClaw Gateway...${NC}"
 echo ""
 
-export OPENCLAW_CONFIG_PATH="$CONFIG_FILE"
-export OPENCLAW_ALLOW_INSECURE_PRIVATE_WS=1
+OPENCLAW_CONTAINER_CONFIG_PATH="/home/node/.openclaw/openclaw.json"
 
-# 后台启动 Gateway
-# Gateway 会 fork 出 daemon 子进程后父进程退出，所以不能用 wait $PID
-openclaw gateway --allow-unconfigured &
+# 后台启动 Gateway 容器。使用默认 bridge 网络保留出站联网能力，但不共享宿主机网络栈。
+docker run -d --name "$OPENCLAW_GATEWAY_CONTAINER_NAME" \
+  --init \
+  --network bridge \
+  --add-host host.docker.internal:host-gateway \
+  -p "${GATEWAY_PORT}:${GATEWAY_CONTAINER_PORT}" \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+  -e HOME=/home/node \
+  -e OPENCLAW_CONFIG_PATH="${OPENCLAW_CONTAINER_CONFIG_PATH}" \
+  -e OPENCLAW_ALLOW_INSECURE_PRIVATE_WS=1 \
+  -e OPENCLAW_DISABLE_BONJOUR=1 \
+  -e OPENCLAW_GATEWAY_TOKEN="${GATEWAY_TOKEN}" \
+  -v "${CONFIG_DIR}:/home/node/.openclaw" \
+  -v "${OPENCLAW_PLUGIN_VOLUME}:/var/lib/openclaw/plugin-runtime-deps" \
+  "$OPENCLAW_IMAGE" \
+  node dist/index.js gateway --allow-unconfigured --bind lan --port "${GATEWAY_CONTAINER_PORT}" >/dev/null
 
 # 等待 Gateway 就绪（最多 20 秒）
 echo -e "    等待 Gateway 就绪..."
 GW_WAIT=0
-while ! curl -sf "http://127.0.0.1:${GATEWAY_PORT}/__openclaw__/canvas/" > /dev/null 2>&1; do
+while ! curl -sf "http://127.0.0.1:${GATEWAY_PORT}/healthz" > /dev/null 2>&1; do
     sleep 1
     GW_WAIT=$((GW_WAIT + 1))
+    if ! docker ps --format '{{.Names}}' | grep -q "^${OPENCLAW_GATEWAY_CONTAINER_NAME}$"; then
+        echo -e "${RED}  ✗ Gateway 容器意外退出，请查看日志：${NC}"
+        echo -e "${CYAN}      docker logs ${OPENCLAW_GATEWAY_CONTAINER_NAME}${NC}"
+        exit 1
+    fi
     if [[ $GW_WAIT -ge 20 ]]; then
         echo -e "${YELLOW}  ⚠ Gateway 启动超时，继续输出链接...${NC}"
         break
@@ -658,10 +685,10 @@ echo -e "完整局域网链接（请复制此链接，包含完整 token）："
 echo -e "${CYAN}${LAN_URL}${NC}"
 echo ""
 
-# 保持前台运行，轮询 openclaw-gateway 进程是否存在
+# 保持前台运行，轮询 OpenClaw Gateway 容器是否存在
 echo -e "${YELLOW}Gateway 已在后台运行（按 Ctrl+C 或运行 'bash start_all.sh stop' 停止）...${NC}"
-trap 'echo -e "\n${YELLOW}正在停止 OpenClaw Gateway...${NC}"; pkill -f openclaw-gateway 2>/dev/null || true; exit 0' INT TERM
-while pgrep -x openclaw-gateway > /dev/null 2>&1; do
+trap 'echo -e "\n${YELLOW}正在停止 OpenClaw Gateway 容器...${NC}"; docker rm -f "$OPENCLAW_GATEWAY_CONTAINER_NAME" 2>/dev/null || true; exit 0' INT TERM
+while docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${OPENCLAW_GATEWAY_CONTAINER_NAME}$"; do
     sleep 5
 done
 echo -e "${YELLOW}OpenClaw Gateway 已退出。${NC}"

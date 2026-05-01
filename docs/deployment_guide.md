@@ -58,6 +58,12 @@ DGX Spark 上如果配置了 `~/.docker/config.json` 中的全局代理（如 Cl
 
 这只影响推理容器，不影响宿主机的代理设置。
 
+### 2.4 关于 OpenClaw Gateway 容器网络
+
+OpenClaw Gateway 运行在 Docker 默认 bridge 网络中，不使用 `--network host`。bridge 网络仍然具备出站访问互联网的能力，Gateway 可以访问外部 API；同时脚本只通过 `-p` 映射必要的 Gateway 端口。
+
+Gateway 容器访问宿主机上的 vLLM/Ollama 时使用 `host.docker.internal`，脚本会通过 `--add-host host.docker.internal:host-gateway` 在 Linux Docker Engine 上补齐该地址。
+
 ---
 
 ## 3. 快速部署
@@ -79,8 +85,8 @@ chmod +x install.sh start_all.sh
 安装脚本会完成以下工作：
 
 1. 交互式选择模型方案（菜单选择 1/2/3）
-2. 检查并安装基础依赖（Docker、curl、wget、jq、Node.js、Ollama）
-3. 全局安装 OpenClaw（`npm install -g openclaw`）
+2. 检查并安装基础依赖（Docker、curl、wget、jq、Ollama）
+3. 拉取 OpenClaw Gateway Docker 镜像（默认 `ghcr.io/openclaw/openclaw:latest`）
 4. 拉取推理框架 Docker 镜像（含国内镜像加速）
 5. 下载模型文件（含多方案容错和断点续传）
 6. 将部署配置保存至 `~/.openclaw_deploy_config`
@@ -100,9 +106,9 @@ chmod +x install.sh start_all.sh
 5. 等待推理服务就绪（实时显示日志）
 6. 发送测试请求验证模型推理功能
 7. 生成或复用 OpenClaw token
-8. 停止已有 Gateway 实例（包括 systemd 管理的实例）
+8. 停止已有 OpenClaw Gateway 容器
 9. 写入 `~/.openclaw/openclaw.json` 配置文件
-10. 启动 OpenClaw Gateway
+10. 以受限 Docker 容器启动 OpenClaw Gateway
 11. 输出完整的访问链接（含 token）
 
 ---
@@ -233,6 +239,7 @@ Ollama 提供 OpenAI 兼容 API（`/v1/chat/completions`），OpenClaw 可直接
   "models": {
     "providers": {
       "...": {
+        "baseUrl": "http://host.docker.internal:8000/v1",
         "compat": { "supportsStore": false }  // 禁用 store 字段（本地模型不支持）
       }
     }
@@ -241,6 +248,8 @@ Ollama 提供 OpenAI 兼容 API（`/v1/chat/completions`），OpenClaw 可直接
 ```
 
 `supportsStore: false` 是关键配置，缺少此项会导致 OpenClaw 发送带 `"store": true` 的请求，本地 vLLM/Ollama 不支持该字段，返回 400 错误。
+
+OpenClaw 运行在容器中，因此配置里的 `baseUrl` 使用 `host.docker.internal` 回连宿主机推理服务，而不是容器自身的 `127.0.0.1`。
 
 ---
 
@@ -256,15 +265,16 @@ http://192.168.0.103:18789/?token=abc123...
 
 **请使用脚本输出的完整链接**（包含 `?token=xxx`），不要手动输入 IP:端口。Gateway 收到带 token 的请求后会建立服务端 session cookie，后续页面内导航时浏览器自动携带 cookie，不会因页面刷新而丢失认证。
 
-### 8.2 关于 systemd 自动启动
+### 8.2 关于容器权限
 
-OpenClaw 安装时会注册 `openclaw-gateway.service` systemd user service，该服务在用户登录后自动启动。`start_all.sh` 在启动前会先通过 `systemctl --user stop openclaw-gateway.service` 停止该服务，再启动配置好的实例。
+OpenClaw Gateway 不在宿主机全局安装，也不注册 systemd user service。`start_all.sh` 会启动名为 `openclaw-gateway` 的容器，并使用以下限制：
 
-如果不需要 OpenClaw 随系统自动启动，可以禁用：
-
-```bash
-systemctl --user disable openclaw-gateway.service
-```
+- 不使用 `--privileged`
+- 不使用 `--network host`
+- 不挂载 Docker socket
+- 仅映射 Gateway 端口
+- 仅挂载 `~/.openclaw` 配置目录和插件运行依赖卷
+- 添加 `--cap-drop ALL` 与 `no-new-privileges`
 
 ---
 
@@ -278,6 +288,7 @@ docker ps | grep openclaw
 
 # 查看容器日志
 docker logs --tail 50 openclaw-vllm
+docker logs --tail 50 openclaw-gateway
 
 # 检查 GPU 内存（正常加载后应占用 60-80GB）
 nvidia-smi

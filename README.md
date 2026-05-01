@@ -17,6 +17,7 @@
 - **代理兼容**：自动清除 Docker 容器内的代理环境变量，避免 `~/.docker/config.json` 中的全局代理干扰推理服务。
 - **网络优化**：内置国内镜像源（hf-mirror.com、ModelScope、Docker 镜像加速），无需 VPN 即可高速下载。
 - **断点续传**：模型下载支持断点续传，可随时中断并重新运行脚本继续下载。
+- **容器化 OpenClaw**：OpenClaw Gateway 运行在 Docker bridge 网络中，不使用宿主机安装、不使用 host network，仅映射必要端口并挂载配置目录。
 - **动态端口**：支持通过 `--port` 参数指定 OpenClaw Gateway 对外端口，避免端口冲突。
 - **本地化推理**：所有推理均在本地 DGX Spark 完成，数据无需上云，零 API 成本。
 
@@ -36,7 +37,7 @@ chmod +x install.sh start_all.sh
 
 ### 2. 安装环境与模型（首次运行）
 
-运行后会弹出交互式菜单，选择要部署的模型方案。脚本会自动完成依赖安装、Docker 镜像拉取和模型文件下载。
+运行后会弹出交互式菜单，选择要部署的模型方案。脚本会自动完成依赖安装、OpenClaw Gateway 镜像拉取、推理框架 Docker 镜像拉取和模型文件下载。
 
 ```bash
 ./install.sh
@@ -83,8 +84,8 @@ chmod +x install.sh start_all.sh
 
 | 脚本 | 功能 |
 |------|------|
-| `install.sh` | 交互式选择模型方案，自动安装依赖、配置国内镜像、拉取 Docker 镜像、下载模型文件，并将部署配置保存至 `~/.openclaw_deploy_config` |
-| `start_all.sh` | 读取部署配置，一键启动推理服务（vLLM/Ollama）和 OpenClaw Gateway，支持 `--port` 参数和 `stop` 命令 |
+| `install.sh` | 交互式选择模型方案，自动安装依赖、配置国内镜像、拉取 OpenClaw/推理框架 Docker 镜像、下载模型文件，并将部署配置保存至 `~/.openclaw_deploy_config` |
+| `start_all.sh` | 读取部署配置，一键启动推理服务（vLLM/Ollama）和容器化 OpenClaw Gateway，支持 `--port` 参数和 `stop` 命令 |
 
 ## 常见问题
 

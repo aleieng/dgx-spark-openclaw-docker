@@ -14,6 +14,7 @@ set -euo pipefail
 DEPLOY_CONFIG="$HOME/.openclaw_deploy_config"   # 部署配置持久化文件
 MODEL_BASE_DIR="$HOME/openclaw_project/models"  # 模型根目录
 HF_ENDPOINT="https://hf-mirror.com"             # 国内 HF 镜像源
+OPENCLAW_IMAGE="ghcr.io/openclaw/openclaw:latest" # OpenClaw 官方 Docker 镜像
 
 # ── 颜色输出 ──────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -111,6 +112,7 @@ VLLM_IMAGE="${VLLM_IMAGE}"
 MODEL_BASE_DIR="${MODEL_BASE_DIR}"
 VLLM_PORT=${VLLM_PORT}
 OLLAMA_PORT=${OLLAMA_PORT}
+OPENCLAW_IMAGE="${OPENCLAW_IMAGE}"
 EOF
 echo -e "${GREEN}  ✓ 部署配置已保存至 ${DEPLOY_CONFIG}${NC}"
 
@@ -120,23 +122,21 @@ echo -e "${GREEN}  ✓ 部署配置已保存至 ${DEPLOY_CONFIG}${NC}"
 echo ""
 echo -e "${YELLOW}[1/5] 检查基础依赖...${NC}"
 
-# Docker（vLLM 必须）
-if [[ "$SELECTED_FRAMEWORK" == "vllm" ]]; then
-    if ! command -v docker &>/dev/null; then
-        echo -e "${RED}  ✗ 未找到 docker，请先安装 Docker：https://docs.docker.com/engine/install/ubuntu/${NC}"
-        exit 1
-    fi
-    # 检查 Docker 权限
-    if ! docker info &>/dev/null 2>&1; then
-        echo "    当前用户没有 Docker 权限，正在自动修复..."
-        sudo usermod -aG docker "$USER"
-        echo -e "${YELLOW}  ⚠ 已将用户 ${USER} 加入 docker 组。${NC}"
-        echo -e "${YELLOW}    请运行以下命令使权限生效，然后重新运行本脚本：${NC}"
-        echo -e "${CYAN}      newgrp docker${NC}"
-        exit 0
-    fi
-    echo -e "${GREEN}  ✓ docker${NC}"
+# Docker（OpenClaw Gateway 容器与 vLLM 必须）
+if ! command -v docker &>/dev/null; then
+    echo -e "${RED}  ✗ 未找到 docker，请先安装 Docker：https://docs.docker.com/engine/install/ubuntu/${NC}"
+    exit 1
 fi
+# 检查 Docker 权限
+if ! docker info &>/dev/null 2>&1; then
+    echo "    当前用户没有 Docker 权限，正在自动修复..."
+    sudo usermod -aG docker "$USER"
+    echo -e "${YELLOW}  ⚠ 已将用户 ${USER} 加入 docker 组。${NC}"
+    echo -e "${YELLOW}    请运行以下命令使权限生效，然后重新运行本脚本：${NC}"
+    echo -e "${CYAN}      newgrp docker${NC}"
+    exit 0
+fi
+echo -e "${GREEN}  ✓ docker${NC}"
 
 # curl
 if ! command -v curl &>/dev/null; then
@@ -159,16 +159,6 @@ if ! command -v jq &>/dev/null; then
 fi
 echo -e "${GREEN}  ✓ jq${NC}"
 
-# Node.js + npm（OpenClaw 必须）
-if ! command -v npm &>/dev/null; then
-    echo "    未找到 npm，正在自动安装 Node.js LTS..."
-    curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-    sudo apt-get install -y nodejs
-    echo -e "${GREEN}  ✓ Node.js $(node -v) / npm $(npm -v) 安装成功${NC}"
-else
-    echo -e "${GREEN}  ✓ Node.js $(node -v) / npm $(npm -v)${NC}"
-fi
-
 # Ollama 框架专属依赖
 if [[ "$SELECTED_FRAMEWORK" == "ollama" ]]; then
     if ! command -v ollama &>/dev/null; then
@@ -181,22 +171,23 @@ if [[ "$SELECTED_FRAMEWORK" == "ollama" ]]; then
 fi
 
 # ════════════════════════════════════════════════════════════════
-# 步骤 2：安装 OpenClaw
+# 步骤 2：准备 OpenClaw Docker 镜像
 # ════════════════════════════════════════════════════════════════
 echo ""
-echo -e "${YELLOW}[2/5] 安装 OpenClaw...${NC}"
+echo -e "${YELLOW}[2/5] 准备 OpenClaw Docker 镜像...${NC}"
 
-if ! command -v openclaw &>/dev/null; then
-    echo "    正在全局安装 OpenClaw..."
-    git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-    git config --global url."https://github.com/".insteadOf "git@github.com:"
-    if sudo npm install -g openclaw; then
-        echo -e "${GREEN}  ✓ OpenClaw $(openclaw --version 2>/dev/null || echo '') 安装成功${NC}"
-    else
-        echo -e "${RED}  ✗ OpenClaw 安装失败，请检查 npm 配置${NC}"; exit 1
-    fi
+echo "    目标镜像：${OPENCLAW_IMAGE}"
+if docker image inspect "$OPENCLAW_IMAGE" &>/dev/null; then
+    echo -e "${GREEN}  ✓ OpenClaw 镜像已在本地，跳过拉取${NC}"
 else
-    echo -e "${GREEN}  ✓ OpenClaw 已安装${NC}"
+    echo "    正在拉取 OpenClaw 官方镜像..."
+    if docker pull "$OPENCLAW_IMAGE"; then
+        echo -e "${GREEN}  ✓ OpenClaw Docker 镜像准备完成${NC}"
+    else
+        echo -e "${RED}  ✗ OpenClaw 镜像拉取失败，请检查网络或手动执行：${NC}"
+        echo -e "${CYAN}      docker pull ${OPENCLAW_IMAGE}${NC}"
+        exit 1
+    fi
 fi
 
 # ════════════════════════════════════════════════════════════════
