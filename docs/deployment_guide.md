@@ -129,6 +129,8 @@ chmod +x install.sh start_all.sh
 10. 以受限 Docker 容器启动 OpenClaw Gateway
 11. 输出完整的访问链接（含 token）
 
+首次启动 OpenClaw Gateway 时，容器可能会 staging bundled runtime deps（插件运行依赖），通常需要 1-3 分钟；后续依赖已缓存到 `~/.openclaw/plugin-runtime-deps` 后会明显变快。
+
 ---
 
 ## 4. 方案 A：Qwen3.5-35B-A3B（vLLM）
@@ -290,19 +292,19 @@ OpenClaw Gateway 不在宿主机全局安装，也不注册 systemd user service
 - 不使用 `--privileged`
 - 不使用 `--network host`
 - 不挂载 Docker socket
-- 仅映射 Gateway 端口
-- 使用宿主机当前 UID/GID 运行容器，避免 `~/.openclaw/workspace` 写入权限不匹配
+- 仅将 Gateway 端口显式发布到宿主机 `0.0.0.0`
+- 使用镜像默认 `node` 用户运行容器，仅将 `~/.openclaw` 下必要写入路径设为 `1000:1000`
 - 仅挂载 `~/.openclaw` 配置目录和其中的插件运行依赖目录
 - 添加 `--cap-drop ALL` 与 `no-new-privileges`
 
-如果看到 `EACCES: permission denied, mkdir '/home/node/.openclaw/workspace'`，通常是旧版本脚本使用镜像默认 `node` 用户运行容器，而该用户的 UID/GID 与宿主机当前用户不一致。新版脚本会使用宿主机当前 UID/GID 运行 Gateway 容器，停止旧容器后重新启动即可：
+如果看到 `EACCES: permission denied, mkdir '/home/node/.openclaw/workspace'`，通常是宿主机挂载目录对容器内 `node` 用户不可写。新版脚本会在启动前将 `openclaw.json`、token、`workspace` 和 `plugin-runtime-deps` 设为容器内 `node` 用户对应的 `1000:1000`，停止旧容器后重新启动即可：
 
 ```bash
 ./start_all.sh stop
 ./start_all.sh
 ```
 
-只有当脚本明确提示 `~/.openclaw` 在宿主机上不可写时，才需要修复该目录的宿主机权限。
+该权限调整只作用于 OpenClaw 容器需要写入的文件和目录，不会递归修改整个 `~/.openclaw`。
 
 ---
 

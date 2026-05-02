@@ -23,6 +23,8 @@ TOKEN_FILE="$CONFIG_DIR/.gateway_token"
 OPENCLAW_GATEWAY_CONTAINER_NAME="openclaw-gateway"
 OPENCLAW_WORKSPACE_DIR="$CONFIG_DIR/workspace"
 OPENCLAW_PLUGIN_DIR="$CONFIG_DIR/plugin-runtime-deps"
+OPENCLAW_CONTAINER_UID=1000
+OPENCLAW_CONTAINER_GID=1000
 
 # ── 颜色输出 ──────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -524,13 +526,6 @@ echo ""
 echo -e "${YELLOW}[5/6] 准备 OpenClaw 配置...${NC}"
 mkdir -p "$CONFIG_DIR" "$OPENCLAW_WORKSPACE_DIR" "$OPENCLAW_PLUGIN_DIR"
 
-if [[ ! -w "$CONFIG_DIR" || ! -w "$OPENCLAW_WORKSPACE_DIR" || ! -w "$OPENCLAW_PLUGIN_DIR" ]]; then
-    echo -e "${RED}  ✗ OpenClaw 配置目录不可写：${CONFIG_DIR}${NC}"
-    echo -e "    请修复宿主机目录权限后重试："
-    echo -e "${CYAN}      sudo chown -R $(id -u):$(id -g) \"${CONFIG_DIR}\"${NC}"
-    exit 1
-fi
-
 # 生成或复用 token
 if [[ -f "$TOKEN_FILE" ]]; then
     GATEWAY_TOKEN=$(cat "$TOKEN_FILE")
@@ -541,6 +536,11 @@ else
     chmod 600 "$TOKEN_FILE"
     echo -e "${GREEN}  ✓ 已生成新 Token${NC}"
 fi
+
+echo -e "    正在设置 OpenClaw 容器写入目录权限（UID:GID ${OPENCLAW_CONTAINER_UID}:${OPENCLAW_CONTAINER_GID}）..."
+sudo chown -R "${OPENCLAW_CONTAINER_UID}:${OPENCLAW_CONTAINER_GID}" \
+    "$CONFIG_FILE" "$TOKEN_FILE" "$OPENCLAW_WORKSPACE_DIR" "$OPENCLAW_PLUGIN_DIR"
+echo -e "${GREEN}  ✓ OpenClaw 容器写入权限已准备${NC}"
 
 # 停止已有 Gateway 实例
 echo -e "    正在停止已有 OpenClaw Gateway 容器..."
@@ -670,16 +670,13 @@ echo -e "${YELLOW}[6/6] 正在启动 OpenClaw Gateway...${NC}"
 echo ""
 
 OPENCLAW_CONTAINER_CONFIG_PATH="/home/node/.openclaw/openclaw.json"
-OPENCLAW_CONTAINER_UID="$(id -u)"
-OPENCLAW_CONTAINER_GID="$(id -g)"
 
 # 后台启动 Gateway 容器。使用默认 bridge 网络保留出站联网能力，但不共享宿主机网络栈。
 docker run -d --name "$OPENCLAW_GATEWAY_CONTAINER_NAME" \
   --init \
-  --user "${OPENCLAW_CONTAINER_UID}:${OPENCLAW_CONTAINER_GID}" \
   --network bridge \
   --add-host host.docker.internal:host-gateway \
-  -p "${GATEWAY_PORT}:${GATEWAY_CONTAINER_PORT}" \
+  -p "0.0.0.0:${GATEWAY_PORT}:${GATEWAY_CONTAINER_PORT}" \
   --cap-drop ALL \
   --security-opt no-new-privileges:true \
   --tmpfs /tmp:rw,nosuid,nodev,size=256m \
@@ -693,10 +690,16 @@ docker run -d --name "$OPENCLAW_GATEWAY_CONTAINER_NAME" \
   "$OPENCLAW_IMAGE" \
   node dist/index.js gateway --allow-unconfigured --bind lan --port "${GATEWAY_CONTAINER_PORT}" >/dev/null
 
-# 等待 Gateway 就绪（最多 20 秒）
+# 等待 Gateway 就绪。首次启动会 staging bundled runtime deps，可能需要 1-3 分钟。
 echo -e "    等待 Gateway 就绪..."
 GW_WAIT=0
-while ! curl -sf "http://127.0.0.1:${GATEWAY_PORT}/healthz" > /dev/null 2>&1; do
+GW_MAX_WAIT=300
+_gateway_ready() {
+    local status
+    status=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${GATEWAY_PORT}/?token=${GATEWAY_TOKEN}" 2>/dev/null || true)
+    [[ "$status" =~ ^(200|302|401|403)$ ]]
+}
+while ! _gateway_ready; do
     sleep 1
     GW_WAIT=$((GW_WAIT + 1))
     if ! docker ps --format '{{.Names}}' | grep -q "^${OPENCLAW_GATEWAY_CONTAINER_NAME}$"; then
@@ -704,11 +707,20 @@ while ! curl -sf "http://127.0.0.1:${GATEWAY_PORT}/healthz" > /dev/null 2>&1; do
         echo -e "${CYAN}      docker logs ${OPENCLAW_GATEWAY_CONTAINER_NAME}${NC}"
         exit 1
     fi
-    if [[ $GW_WAIT -ge 20 ]]; then
-        echo -e "${YELLOW}  ⚠ Gateway 启动超时，继续输出链接...${NC}"
-        break
+    if [[ $((GW_WAIT % 15)) -eq 0 ]]; then
+        echo -e "    Gateway 仍在启动中（${GW_WAIT}s/${GW_MAX_WAIT}s），首次启动安装插件依赖会较慢..."
+    fi
+    if [[ $GW_WAIT -ge $GW_MAX_WAIT ]]; then
+        echo -e "${RED}  ✗ Gateway 启动超时（${GW_MAX_WAIT}s），请查看日志：${NC}"
+        echo -e "${CYAN}      docker logs ${OPENCLAW_GATEWAY_CONTAINER_NAME}${NC}"
+        echo -e "${YELLOW}    当前端口映射：${NC}"
+        docker ps --filter "name=^/${OPENCLAW_GATEWAY_CONTAINER_NAME}$" --format '      {{.Names}}  {{.Ports}}' 2>/dev/null || true
+        echo -e "${YELLOW}    最近日志：${NC}"
+        docker logs --tail 30 "$OPENCLAW_GATEWAY_CONTAINER_NAME" 2>/dev/null || true
+        exit 1
     fi
 done
+echo -e "${GREEN}  ✓ Gateway 已就绪${NC}"
 
 # 生成访问链接
 # 使用 ?token= 查询参数格式（官方标准格式）
