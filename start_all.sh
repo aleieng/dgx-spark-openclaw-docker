@@ -9,7 +9,8 @@
 #    - MiniMax-M2.5-REAP-NVFP4  → vLLM（专用 NVFP4 内核）
 #    - GLM-4.7-Flash            → Ollama
 #  使用：bash start_all.sh [--port PORT]
-#  停止：bash start_all.sh stop
+#  停止 Gateway：bash start_all.sh stop
+#  停止所有服务：bash start_all.sh stop --all
 # ============================================================
 set -euo pipefail
 
@@ -36,7 +37,8 @@ NC='\033[0m'
 
 # ── 命令行参数解析 ─────────────────────────────────────────────
 _do_stop=false
-FORCE_RESTART=false
+_stop_all=false
+RESTART_MODEL=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)
@@ -51,24 +53,30 @@ while [[ $# -gt 0 ]]; do
             _do_stop=true
             shift
             ;;
-        -force_restart|--force_restart|--force-restart)
-            FORCE_RESTART=true
+        all|--all|-all|--stop-all)
+            _stop_all=true
+            shift
+            ;;
+        -restart_model|--restart_model|--restart-model)
+            RESTART_MODEL=true
             shift
             ;;
         -h|--help)
-            echo "用法：bash start_all.sh [--port PORT] [-force_restart]"
+            echo "用法：bash start_all.sh [--port PORT] [--restart_model]"
             echo ""
             echo "选项："
             echo "  --port PORT   指定 OpenClaw Gateway 对外 HTTP 端口（默认：18789）"
-            echo "  -force_restart 强制重启推理服务，即使现有 vLLM 容器可用"
-            echo "  stop          停止所有服务"
+            echo "  --restart_model 强制重启推理服务，即使现有 vLLM 容器可用"
+            echo "  stop          仅停止 OpenClaw Gateway（默认不停止 vLLM/Ollama）"
+            echo "  stop --all    停止 OpenClaw Gateway 和推理服务"
             echo "  -h, --help    显示此帮助信息"
             echo ""
             echo "示例："
             echo "  bash start_all.sh                # 使用默认端口 18789 启动"
             echo "  bash start_all.sh --port 8080    # 使用端口 8080 启动"
-            echo "  bash start_all.sh -force_restart # 强制重启推理服务"
-            echo "  bash start_all.sh stop           # 停止所有服务"
+            echo "  bash start_all.sh --restart_model # 强制重启推理服务"
+            echo "  bash start_all.sh stop           # 仅停止 Gateway"
+            echo "  bash start_all.sh stop --all     # 停止所有服务"
             exit 0
             ;;
         *)
@@ -113,18 +121,24 @@ print_banner
 # stop 模式
 # ════════════════════════════════════════════════════════════════
 if [[ "$_do_stop" == "true" ]]; then
-    echo -e "${YELLOW}正在停止所有服务...${NC}"
-
-    # 停止 vLLM 容器
-    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
-        docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-        echo -e "${GREEN}  ✓ 推理容器（${CONTAINER_NAME}）已停止${NC}"
+    if [[ "$_stop_all" == "true" ]]; then
+        echo -e "${YELLOW}正在停止所有服务...${NC}"
+    else
+        echo -e "${YELLOW}正在停止 OpenClaw Gateway（保留推理服务）...${NC}"
     fi
 
-    # 停止 Ollama 服务
-    if [[ "${SELECTED_FRAMEWORK:-}" == "ollama" ]]; then
-        pkill -f "ollama serve" 2>/dev/null || true
-        echo -e "${GREEN}  ✓ Ollama 服务已停止${NC}"
+    if [[ "$_stop_all" == "true" ]]; then
+        # 停止 vLLM 容器
+        if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+            echo -e "${GREEN}  ✓ 推理容器（${CONTAINER_NAME}）已停止${NC}"
+        fi
+
+        # 停止 Ollama 服务
+        if [[ "${SELECTED_FRAMEWORK:-}" == "ollama" ]]; then
+            pkill -f "ollama serve" 2>/dev/null || true
+            echo -e "${GREEN}  ✓ Ollama 服务已停止${NC}"
+        fi
     fi
 
     # 停止 OpenClaw Gateway 容器
@@ -135,7 +149,11 @@ if [[ "$_do_stop" == "true" ]]; then
         echo -e "${GREEN}  ✓ OpenClaw Gateway 容器未运行${NC}"
     fi
 
-    echo -e "${GREEN}${BOLD}所有服务已停止。${NC}"
+    if [[ "$_stop_all" == "true" ]]; then
+        echo -e "${GREEN}${BOLD}所有服务已停止。${NC}"
+    else
+        echo -e "${GREEN}${BOLD}OpenClaw Gateway 已停止，推理服务仍保留运行。${NC}"
+    fi
     exit 0
 fi
 
@@ -490,12 +508,12 @@ _verify_model_inference() {
 }
 
 REUSED_EXISTING_INFERENCE=false
-if [[ "${SELECTED_FRAMEWORK:-vllm}" == "vllm" && "$FORCE_RESTART" != "true" ]] \
+if [[ "${SELECTED_FRAMEWORK:-vllm}" == "vllm" && "$RESTART_MODEL" != "true" ]] \
     && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
     REUSED_EXISTING_INFERENCE=true
     echo ""
     echo -e "${YELLOW}[2-4/6] 检测到已运行的 vLLM 容器，跳过清理/启动/等待：${CONTAINER_NAME}${NC}"
-    echo -e "    如需强制重启推理服务，请使用 ${CYAN}-force_restart${NC}"
+    echo -e "    如需强制重启推理服务，请使用 ${CYAN}--restart_model${NC}"
 else
     _restart_inference_services
 fi

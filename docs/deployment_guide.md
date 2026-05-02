@@ -112,7 +112,7 @@ chmod +x install.sh start_all.sh
 如果 vLLM 容器已经在运行，脚本默认会跳过清理、启动和等待步骤，直接验证模型推理功能。验证失败时才会自动回退到清理并重启推理服务。如需无条件重启推理服务，可使用：
 
 ```bash
-./start_all.sh -force_restart
+./start_all.sh --restart_model
 ```
 
 启动脚本会完成以下工作：
@@ -130,6 +130,18 @@ chmod +x install.sh start_all.sh
 11. 输出完整的访问链接（含 token）
 
 首次启动 OpenClaw Gateway 时，容器可能会 staging bundled runtime deps（插件运行依赖），通常需要 1-3 分钟；后续依赖已缓存到 `~/.openclaw/plugin-runtime-deps` 后会明显变快。
+
+停止服务时，默认只停止 OpenClaw Gateway，保留 vLLM/Ollama 推理服务以避免下次重新加载模型：
+
+```bash
+./start_all.sh stop
+```
+
+如需停止所有服务：
+
+```bash
+./start_all.sh stop --all
+```
 
 ---
 
@@ -303,6 +315,8 @@ OpenClaw Gateway 不在宿主机全局安装，也不注册 systemd user service
 ./start_all.sh stop
 ./start_all.sh
 ```
+
+默认 `stop` 只停止 OpenClaw Gateway，不停止 vLLM/Ollama 推理服务。需要停止全部服务时使用 `./start_all.sh stop --all`。
 
 该权限调整只作用于 OpenClaw 容器需要写入的文件和目录，不会递归修改整个 `~/.openclaw`。
 

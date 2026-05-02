@@ -59,7 +59,7 @@ chmod +x install.sh start_all.sh
 ./start_all.sh --port 8080
 
 # 如果需要强制重启推理服务
-./start_all.sh -force_restart
+./start_all.sh --restart_model
 ```
 
 脚本启动后会输出完整的访问链接（包含 token），将**局域网访问链接**复制到笔记本浏览器即可使用。
@@ -77,10 +77,14 @@ chmod +x install.sh start_all.sh
 
 > **重要**：请使用脚本输出的完整链接（包含 `?token=xxx`），不要手动输入 IP:端口。首次访问后浏览器会保存 session cookie，后续页面内导航不再需要 token。
 
-### 4. 停止所有服务
+### 4. 停止服务
 
 ```bash
+# 默认仅停止 OpenClaw Gateway，保留 vLLM/Ollama 推理服务
 ./start_all.sh stop
+
+# 如需停止所有服务
+./start_all.sh stop --all
 ```
 
 ## 脚本说明
@@ -88,7 +92,7 @@ chmod +x install.sh start_all.sh
 | 脚本 | 功能 |
 |------|------|
 | `install.sh` | 交互式选择模型方案，自动安装依赖、配置国内镜像、拉取 OpenClaw/推理框架 Docker 镜像、下载模型文件，并将部署配置保存至 `~/.openclaw_deploy_config` |
-| `start_all.sh` | 读取部署配置，一键启动推理服务（vLLM/Ollama）和容器化 OpenClaw Gateway，支持 `--port` 参数和 `stop` 命令 |
+| `start_all.sh` | 读取部署配置，一键启动推理服务（vLLM/Ollama）和容器化 OpenClaw Gateway，支持 `--port`、`--restart_model`、`stop` 和 `stop --all` |
 
 ## 常见问题
 
