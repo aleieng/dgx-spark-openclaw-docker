@@ -109,13 +109,19 @@ chmod +x install.sh start_all.sh
 ./start_all.sh
 ```
 
+如果 vLLM 容器已经在运行，脚本默认会跳过清理、启动和等待步骤，直接验证模型推理功能。验证失败时才会自动回退到清理并重启推理服务。如需无条件重启推理服务，可使用：
+
+```bash
+./start_all.sh -force_restart
+```
+
 启动脚本会完成以下工作：
 
 1. 读取 `~/.openclaw_deploy_config` 中的部署配置
 2. 校验模型文件完整性
-3. 清理旧的推理服务容器/进程
+3. 如无可复用的 vLLM 容器，清理旧的推理服务容器/进程
 4. 启动推理服务（vLLM Docker 容器 或 Ollama 进程）
-5. 等待推理服务就绪（实时显示日志）
+5. 等待推理服务就绪（实时显示日志）；可复用 vLLM 容器时跳过此步骤
 6. 发送测试请求验证模型推理功能
 7. 生成或复用 OpenClaw token
 8. 停止已有 OpenClaw Gateway 容器
@@ -285,8 +291,18 @@ OpenClaw Gateway 不在宿主机全局安装，也不注册 systemd user service
 - 不使用 `--network host`
 - 不挂载 Docker socket
 - 仅映射 Gateway 端口
-- 仅挂载 `~/.openclaw` 配置目录和插件运行依赖卷
+- 使用宿主机当前 UID/GID 运行容器，避免 `~/.openclaw/workspace` 写入权限不匹配
+- 仅挂载 `~/.openclaw` 配置目录和其中的插件运行依赖目录
 - 添加 `--cap-drop ALL` 与 `no-new-privileges`
+
+如果看到 `EACCES: permission denied, mkdir '/home/node/.openclaw/workspace'`，通常是旧版本脚本使用镜像默认 `node` 用户运行容器，而该用户的 UID/GID 与宿主机当前用户不一致。新版脚本会使用宿主机当前 UID/GID 运行 Gateway 容器，停止旧容器后重新启动即可：
+
+```bash
+./start_all.sh stop
+./start_all.sh
+```
+
+只有当脚本明确提示 `~/.openclaw` 在宿主机上不可写时，才需要修复该目录的宿主机权限。
 
 ---
 

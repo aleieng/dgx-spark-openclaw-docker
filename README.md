@@ -57,6 +57,9 @@ chmod +x install.sh start_all.sh
 
 # 或指定端口启动
 ./start_all.sh --port 8080
+
+# 如果需要强制重启推理服务
+./start_all.sh -force_restart
 ```
 
 脚本启动后会输出完整的访问链接（包含 token），将**局域网访问链接**复制到笔记本浏览器即可使用。

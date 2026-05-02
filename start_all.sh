@@ -21,7 +21,8 @@ CONFIG_DIR="$HOME/.openclaw"
 CONFIG_FILE="$CONFIG_DIR/openclaw.json"
 TOKEN_FILE="$CONFIG_DIR/.gateway_token"
 OPENCLAW_GATEWAY_CONTAINER_NAME="openclaw-gateway"
-OPENCLAW_PLUGIN_VOLUME="openclaw-plugin-runtime-deps"
+OPENCLAW_WORKSPACE_DIR="$CONFIG_DIR/workspace"
+OPENCLAW_PLUGIN_DIR="$CONFIG_DIR/plugin-runtime-deps"
 
 # ── 颜色输出 ──────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -33,6 +34,7 @@ NC='\033[0m'
 
 # ── 命令行参数解析 ─────────────────────────────────────────────
 _do_stop=false
+FORCE_RESTART=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)
@@ -47,17 +49,23 @@ while [[ $# -gt 0 ]]; do
             _do_stop=true
             shift
             ;;
+        -force_restart|--force_restart|--force-restart)
+            FORCE_RESTART=true
+            shift
+            ;;
         -h|--help)
-            echo "用法：bash start_all.sh [--port PORT]"
+            echo "用法：bash start_all.sh [--port PORT] [-force_restart]"
             echo ""
             echo "选项："
             echo "  --port PORT   指定 OpenClaw Gateway 对外 HTTP 端口（默认：18789）"
+            echo "  -force_restart 强制重启推理服务，即使现有 vLLM 容器可用"
             echo "  stop          停止所有服务"
             echo "  -h, --help    显示此帮助信息"
             echo ""
             echo "示例："
             echo "  bash start_all.sh                # 使用默认端口 18789 启动"
             echo "  bash start_all.sh --port 8080    # 使用端口 8080 启动"
+            echo "  bash start_all.sh -force_restart # 强制重启推理服务"
             echo "  bash start_all.sh stop           # 停止所有服务"
             exit 0
             ;;
@@ -201,6 +209,7 @@ fi
 # ════════════════════════════════════════════════════════════════
 # 步骤 2：清理旧的推理服务
 # ════════════════════════════════════════════════════════════════
+_restart_inference_services() {
 echo ""
 echo -e "${YELLOW}[2/6] 清理旧的推理服务（释放 GPU 内存）...${NC}"
 
@@ -397,13 +406,11 @@ case "${SELECTED_FRAMEWORK:-vllm}" in
 esac
 
 echo -e "${GREEN}  ✓ 推理服务已就绪！${NC}"
+}
 
 # ════════════════════════════════════════════════════════════════
 # 步骤 4.5：发送实际 chat 请求验证模型真正可用
 # ════════════════════════════════════════════════════════════════
-echo ""
-echo -e "${YELLOW}[4.5/6] 验证模型推理功能...${NC}"
-
 _test_model_inference() {
     local port="$1"
     local model_id="$2"
@@ -467,14 +474,44 @@ _test_model_inference() {
     fi
 }
 
-TEST_MODEL_ID=$(curl -sf "http://127.0.0.1:${INFERENCE_PORT}/v1/models" 2>/dev/null \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data'][0]['id'])" 2>/dev/null || echo "")
+_verify_model_inference() {
+    TEST_MODEL_ID=$(curl -sf "http://127.0.0.1:${INFERENCE_PORT}/v1/models" 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data'][0]['id'])" 2>/dev/null || echo "")
 
-if [[ -z "${TEST_MODEL_ID}" ]]; then
-    echo -e "${YELLOW}  ⚠ 无法获取模型 ID，跳过推理测试${NC}"
-else
+    if [[ -z "${TEST_MODEL_ID}" ]]; then
+        echo -e "${YELLOW}  ⚠ 无法获取模型 ID${NC}"
+        return 1
+    fi
+
     echo -e "    测试模型 ID：${TEST_MODEL_ID}"
-    if ! _test_model_inference "${INFERENCE_PORT}" "${TEST_MODEL_ID}"; then
+    _test_model_inference "${INFERENCE_PORT}" "${TEST_MODEL_ID}"
+}
+
+REUSED_EXISTING_INFERENCE=false
+if [[ "${SELECTED_FRAMEWORK:-vllm}" == "vllm" && "$FORCE_RESTART" != "true" ]] \
+    && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    REUSED_EXISTING_INFERENCE=true
+    echo ""
+    echo -e "${YELLOW}[2-4/6] 检测到已运行的 vLLM 容器，跳过清理/启动/等待：${CONTAINER_NAME}${NC}"
+    echo -e "    如需强制重启推理服务，请使用 ${CYAN}-force_restart${NC}"
+else
+    _restart_inference_services
+fi
+
+echo ""
+echo -e "${YELLOW}[4.5/6] 验证模型推理功能...${NC}"
+if ! _verify_model_inference; then
+    if [[ "$REUSED_EXISTING_INFERENCE" == "true" ]]; then
+        echo -e "${YELLOW}  ⚠ 现有 vLLM 容器无法完成推理验证，回退到清理并重启推理服务...${NC}"
+        REUSED_EXISTING_INFERENCE=false
+        _restart_inference_services
+        echo ""
+        echo -e "${YELLOW}[4.5/6] 重新验证模型推理功能...${NC}"
+        if ! _verify_model_inference; then
+            echo -e "${RED}  ✗ 推理服务重启后仍响应异常，请检查上方错误信息。${NC}"
+            exit 1
+        fi
+    else
         echo -e "${RED}  ✗ 推理服务响应异常，请检查上方错误信息后重新启动。${NC}"
         exit 1
     fi
@@ -485,7 +522,14 @@ fi
 # ════════════════════════════════════════════════════════════════
 echo ""
 echo -e "${YELLOW}[5/6] 准备 OpenClaw 配置...${NC}"
-mkdir -p "$CONFIG_DIR"
+mkdir -p "$CONFIG_DIR" "$OPENCLAW_WORKSPACE_DIR" "$OPENCLAW_PLUGIN_DIR"
+
+if [[ ! -w "$CONFIG_DIR" || ! -w "$OPENCLAW_WORKSPACE_DIR" || ! -w "$OPENCLAW_PLUGIN_DIR" ]]; then
+    echo -e "${RED}  ✗ OpenClaw 配置目录不可写：${CONFIG_DIR}${NC}"
+    echo -e "    请修复宿主机目录权限后重试："
+    echo -e "${CYAN}      sudo chown -R $(id -u):$(id -g) \"${CONFIG_DIR}\"${NC}"
+    exit 1
+fi
 
 # 生成或复用 token
 if [[ -f "$TOKEN_FILE" ]]; then
@@ -626,10 +670,13 @@ echo -e "${YELLOW}[6/6] 正在启动 OpenClaw Gateway...${NC}"
 echo ""
 
 OPENCLAW_CONTAINER_CONFIG_PATH="/home/node/.openclaw/openclaw.json"
+OPENCLAW_CONTAINER_UID="$(id -u)"
+OPENCLAW_CONTAINER_GID="$(id -g)"
 
 # 后台启动 Gateway 容器。使用默认 bridge 网络保留出站联网能力，但不共享宿主机网络栈。
 docker run -d --name "$OPENCLAW_GATEWAY_CONTAINER_NAME" \
   --init \
+  --user "${OPENCLAW_CONTAINER_UID}:${OPENCLAW_CONTAINER_GID}" \
   --network bridge \
   --add-host host.docker.internal:host-gateway \
   -p "${GATEWAY_PORT}:${GATEWAY_CONTAINER_PORT}" \
@@ -642,7 +689,7 @@ docker run -d --name "$OPENCLAW_GATEWAY_CONTAINER_NAME" \
   -e OPENCLAW_DISABLE_BONJOUR=1 \
   -e OPENCLAW_GATEWAY_TOKEN="${GATEWAY_TOKEN}" \
   -v "${CONFIG_DIR}:/home/node/.openclaw" \
-  -v "${OPENCLAW_PLUGIN_VOLUME}:/var/lib/openclaw/plugin-runtime-deps" \
+  -v "${OPENCLAW_PLUGIN_DIR}:/var/lib/openclaw/plugin-runtime-deps" \
   "$OPENCLAW_IMAGE" \
   node dist/index.js gateway --allow-unconfigured --bind lan --port "${GATEWAY_CONTAINER_PORT}" >/dev/null
 
