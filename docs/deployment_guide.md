@@ -305,11 +305,11 @@ OpenClaw Gateway 不在宿主机全局安装，也不注册 systemd user service
 - 不使用 `--network host`
 - 不挂载 Docker socket
 - 仅将 Gateway 端口显式发布到宿主机 `0.0.0.0`
-- 使用镜像默认 `node` 用户运行容器，仅将 `~/.openclaw` 下必要写入路径设为 `1000:1000`
+- 使用镜像默认 `node` 用户运行容器，仅将 `workspace` 和 `plugin-runtime-deps` 等容器写入目录设为 `1000:1000`
 - 仅挂载 `~/.openclaw` 配置目录和其中的插件运行依赖目录
 - 添加 `--cap-drop ALL` 与 `no-new-privileges`
 
-如果看到 `EACCES: permission denied, mkdir '/home/node/.openclaw/workspace'`，通常是宿主机挂载目录对容器内 `node` 用户不可写。新版脚本会在启动前将 `openclaw.json`、token、`workspace` 和 `plugin-runtime-deps` 设为容器内 `node` 用户对应的 `1000:1000`，停止旧容器后重新启动即可：
+如果看到 `EACCES: permission denied, mkdir '/home/node/.openclaw/workspace'`，通常是宿主机挂载目录对容器内 `node` 用户不可写。新版脚本会在启动前将 `workspace` 和 `plugin-runtime-deps` 设为容器内 `node` 用户对应的 `1000:1000`，停止旧容器后重新启动即可：
 
 ```bash
 ./start_all.sh stop

@@ -557,7 +557,7 @@ fi
 
 echo -e "    正在设置 OpenClaw 容器写入目录权限（UID:GID ${OPENCLAW_CONTAINER_UID}:${OPENCLAW_CONTAINER_GID}）..."
 sudo chown -R "${OPENCLAW_CONTAINER_UID}:${OPENCLAW_CONTAINER_GID}" \
-    "$CONFIG_FILE" "$TOKEN_FILE" "$OPENCLAW_WORKSPACE_DIR" "$OPENCLAW_PLUGIN_DIR"
+    "$OPENCLAW_WORKSPACE_DIR" "$OPENCLAW_PLUGIN_DIR"
 echo -e "${GREEN}  ✓ OpenClaw 容器写入权限已准备${NC}"
 
 # 停止已有 Gateway 实例
